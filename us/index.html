@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>我们的小想法</title>
+<meta name="description" content="两个人共用的小想法流：随手写一句，双方都能看到、回应和编辑。">
+<meta name="theme-color" content="#FAF9F6">
+<meta name="color-scheme" content="light">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="小想法">
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="icon" href="./icons/icon-192.png">
+<link rel="apple-touch-icon" href="./icons/icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@600;700;900&family=Noto+Sans+SC:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#FAF9F6; --card:#FFFEFB; --ink:#1C1A17; --body:#3D3A34;
+  --gray:#6F6858; --faint:#A69D8C; --mist:#C9C2B2;
+  --line:#EBE5D8; --line2:#F0EBDF; --bd:#DFD9CC;
+  --rose:#B04A5A; --green:#4A7051; --red:#C0502C;
+  --serif:'Noto Serif SC','Source Han Serif SC','Songti SC',serif;
+  --sans:'Noto Sans SC',-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,'SF Mono',Consolas,monospace;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0}
+body{background:var(--paper);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.6}
+button{font-family:inherit;font-size:inherit;color:inherit;background:none;border:none;padding:0;cursor:pointer}
+a{color:#33587A;text-decoration:none} a:hover{color:var(--ink)}
+input,textarea{font-family:inherit;font-size:inherit;color:var(--ink)}
+input::placeholder,textarea::placeholder{color:var(--faint)}
+.mono{font-family:var(--mono)}
+
+#wrap{max-width:600px;margin:0 auto;padding:0 18px 70px;
+  padding-bottom:calc(70px + env(safe-area-inset-bottom))}
+#top{display:flex;align-items:flex-end;justify-content:space-between;gap:10px;
+  padding:26px 2px 18px;position:sticky;top:0;background:var(--paper);z-index:5}
+.logo b{font-family:var(--serif);font-weight:900;font-size:23px;letter-spacing:.06em;display:block;line-height:1.2}
+.logo span{font-size:10px;color:var(--faint);letter-spacing:.28em;display:block;margin-top:3px}
+#top-right{display:flex;align-items:center;gap:12px;padding-bottom:4px}
+#btn-gear{font-size:17px;color:var(--faint);line-height:1;padding:4px}
+#btn-gear:hover{color:var(--ink)}
+.save-line{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;color:var(--green)}
+.save-line .dot{width:6px;height:6px;border-radius:50%;background:var(--green);flex-shrink:0}
+.save-line.err{color:var(--red)} .save-line.err .dot{background:var(--red)}
+.save-line.busy{color:var(--gray)} .save-line.busy .dot{background:var(--mist)}
+.save-line.off{color:var(--faint)} .save-line.off .dot{background:var(--mist)}
+
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px}
+.btn{border:1px solid var(--bd);border-radius:9px;padding:8px 16px;text-align:center;
+  font-size:13px;color:var(--gray);background:var(--card)}
+.btn:hover{border-color:var(--mist);color:var(--ink)}
+.btn.dark{background:var(--ink);color:var(--paper);border-color:var(--ink);font-weight:600}
+.btn.dark:hover{opacity:.88;color:var(--paper)}
+.btn.dark:disabled{opacity:.4;cursor:default}
+.dot8{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
+.empty{padding:44px 12px;text-align:center;color:var(--faint);font-size:13px;line-height:2}
+input.line{border:none;border-bottom:1px solid var(--bd);background:transparent;
+  padding:8px 2px;font-size:14px;outline:none;border-radius:0;width:100%}
+input.line:focus{border-bottom-color:var(--ink)}
+.sec-label{font-size:11px;color:var(--faint);letter-spacing:.14em;margin:22px 0 10px}
+
+/* ---------- 登录 / 身份 ---------- */
+.gate{padding:26px 22px;margin-top:14px}
+.gate h2{font-family:var(--serif);font-weight:900;font-size:21px;margin:0 0 8px}
+.gate .lead{font-size:13px;color:var(--gray);line-height:1.9;margin:0 0 18px}
+.provs{display:flex;gap:8px;margin-bottom:14px}
+.provs button{flex:1;border:1px solid var(--bd);border-radius:9px;padding:9px 6px;font-size:12.5px;color:var(--gray);background:transparent}
+.provs button.on{background:var(--ink);color:var(--paper);border-color:var(--ink);font-weight:600}
+.gate .tip{font-size:11.5px;color:var(--faint);line-height:1.9;margin-top:14px}
+.gate .tip b{color:var(--gray)}
+.gate .err-msg{font-size:12px;color:var(--red);margin-top:10px;line-height:1.7}
+.gate .alt{display:block;text-align:center;font-size:12px;color:var(--faint);margin-top:18px}
+.token-row{display:flex;gap:8px;margin-top:4px}
+.token-row input{flex:1}
+.who-list{display:flex;flex-direction:column;gap:8px}
+.who-list button{display:flex;align-items:center;gap:10px;border:1px solid var(--bd);
+  border-radius:10px;padding:13px 16px;font-size:15px;font-weight:600;background:var(--card);text-align:left}
+.who-list button:hover{border-color:var(--ink)}
+.swatches{display:flex;gap:9px;flex-wrap:wrap;margin:12px 0 16px}
+.swatches button{width:26px;height:26px;border-radius:50%;border:2px solid transparent;padding:0}
+.swatches button.on{border-color:var(--ink);box-shadow:inset 0 0 0 2px var(--paper)}
+
+/* ---------- 写想法 ---------- */
+#composer{border:1.5px solid var(--ink);padding:14px 16px 12px;margin-bottom:8px}
+#cmp{width:100%;border:none;background:transparent;outline:none;resize:none;
+  font-size:15px;line-height:1.7;min-height:52px;max-height:40vh;overflow-y:auto}
+.cmp-foot{display:flex;align-items:center;gap:10px;margin-top:8px}
+.me-chip{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--gray);font-weight:600}
+.cmp-hint{font-size:11px;color:var(--mist);margin-left:auto}
+.cmp-send{background:var(--ink);color:var(--paper);border-radius:9px;padding:7px 20px;font-size:13px;font-weight:600}
+.cmp-send:disabled{opacity:.35;cursor:default}
+
+/* ---------- 想法流 ---------- */
+.day-label{font-size:12px;color:var(--faint);letter-spacing:.1em;margin:24px 2px 10px;display:flex;align-items:center;gap:10px}
+.day-label::after{content:'';flex:1;height:1px;background:var(--line)}
+.th{padding:13px 16px 11px;margin-bottom:10px;border-left:3px solid var(--mist)}
+.th-head{display:flex;align-items:center;gap:8px;font-size:12.5px}
+.th-head b{font-weight:700}
+.th-head .tm{font-family:var(--mono);font-size:11px;color:var(--faint)}
+.th-acts{margin-left:auto;display:flex;gap:12px;opacity:0;transition:opacity .15s}
+.th:hover .th-acts,.th.acts-on .th-acts{opacity:1}
+.th-acts button{font-size:11.5px;color:var(--faint)}
+.th-acts button:hover{color:var(--ink)}
+.th-text{font-size:15px;line-height:1.8;margin:6px 0 4px;white-space:pre-wrap;word-break:break-word}
+.th-foot{display:flex;align-items:center;gap:16px;margin-top:6px}
+.th-foot button{font-size:12px;color:var(--faint);display:inline-flex;align-items:center;gap:5px}
+.th-foot button:hover{color:var(--ink)}
+.th-foot .heart.on{color:var(--rose);font-weight:600}
+.heart .hn{font-size:11px}
+.edit-box textarea{width:100%;border:1px solid var(--bd);border-radius:8px;background:var(--paper);
+  padding:10px 12px;font-size:15px;line-height:1.7;outline:none;resize:vertical;min-height:64px}
+.edit-box textarea:focus{border-color:var(--ink)}
+.edit-acts{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
+.replies{margin-top:10px;border-top:1px dashed var(--line);padding-top:8px;display:flex;flex-direction:column;gap:6px}
+.reply{display:flex;align-items:baseline;gap:8px;font-size:13px;line-height:1.7}
+.reply b{font-size:12px;flex-shrink:0}
+.reply .rt{white-space:pre-wrap;word-break:break-word;flex:1}
+.reply .rx{font-size:11px;color:var(--mist);padding:0 2px}
+.reply .rx:hover{color:var(--red)}
+.reply-form{display:flex;gap:8px;margin-top:10px}
+.reply-form input{flex:1;border:1px solid var(--bd);border-radius:999px;background:var(--paper);
+  padding:7px 14px;font-size:13px;outline:none}
+.reply-form input:focus{border-color:var(--ink)}
+.reply-form button{font-size:12.5px;color:var(--gray);font-weight:600;padding:0 6px}
+.reply-form button:hover{color:var(--ink)}
+
+/* ---------- 设置弹层 ---------- */
+#mask{position:fixed;inset:0;background:rgba(28,26,23,.32);z-index:40}
+#sheet{position:fixed;z-index:41;background:var(--card);border:1px solid var(--line);
+  left:50%;top:50%;transform:translate(-50%,-50%);width:min(480px,calc(100vw - 32px));
+  max-height:84vh;overflow-y:auto;border-radius:14px;padding:22px 22px 26px}
+#sheet .x{position:absolute;top:14px;right:16px;font-size:15px;color:var(--faint);padding:4px}
+#sheet .x:hover{color:var(--ink)}
+#sheet h3{font-family:var(--serif);font-weight:900;font-size:18px;margin:0 0 4px}
+#sheet .kv{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:11px 0;border-bottom:1px solid var(--line2);font-size:13px}
+#sheet .kv .k{color:var(--gray)}
+#sheet .kv .v{display:flex;align-items:center;gap:8px;font-weight:600}
+#sheet .small{font-size:11.5px;color:var(--faint);line-height:1.9;margin-top:14px}
+@media (max-width:560px){
+  #sheet{left:0;right:0;top:auto;bottom:0;transform:none;width:100%;border-radius:16px 16px 0 0;
+    padding-bottom:calc(26px + env(safe-area-inset-bottom))}
+}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <header id="top">
+    <div class="logo"><b>我们的小想法</b><span>OUR LITTLE THOUGHTS</span></div>
+    <div id="top-right">
+      <span id="st-chip" class="save-line off"><span class="dot"></span><span id="st-text">…</span></span>
+      <button id="btn-gear" title="设置" aria-label="设置">⚙</button>
+    </div>
+  </header>
+  <main id="main"></main>
+</div>
+<div id="mask" hidden></div>
+<div id="sheet" hidden></div>
+<script src="./app.js"></script>
+</body>
+</html>

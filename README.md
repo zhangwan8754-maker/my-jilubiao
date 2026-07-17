@@ -27,15 +27,26 @@
 
 ## 数据保存在哪里？如何多设备同步？
 
-数据始终先存在浏览器本地（localStorage），在此之上有两条同步通道，可以只用一条，也可以同时用：
+数据始终先存在浏览器本地（localStorage），在此之上有三条同步通道，可以只用一条，也可以同时用：
 
-### 1. 本地文件 records.json（桌面 Chrome / Edge）
+### 1. 浏览器登录同步（推荐，手机电脑通用）
+
+设置（侧栏底部状态区 / 手机端「已保存」标签）→「浏览器登录同步」：
+
+- **Gitee 码云（国内推荐，无需翻墙）**：打开 [gitee.com/profile/personal_access_tokens/new](https://gitee.com/profile/personal_access_tokens/new) 创建私人令牌，**只勾选 `gists` 权限**，复制粘贴到应用里点「登录」即可。
+- **GitHub**（适合能访问 GitHub 的环境）：[创建经典令牌](https://github.com/settings/tokens/new?scopes=gist&description=liuhen)，只勾选 `gist` 权限。
+
+登录后数据自动保存到**你自己账号下的私密代码片段（Gist）**，别人看不到；换任何设备打开本页、粘贴同一个令牌登录，就能看到同样的数据。改动后 1 秒内上传，约每分钟自动拉取合并。令牌只保存在各设备浏览器本地。
+
+> 提示：GitHub Pages（github.io）在国内部分网络下访问不稳定；如遇打不开，可把本仓库几个静态文件部署到任何国内可访问的静态空间（无构建步骤，原样上传即可），Gitee 登录同步照常工作。
+
+### 2. 本地文件 records.json（桌面 Chrome / Edge）
 
 侧栏底部 → 「存储与同步」→ 新建或连接 `records.json`。此后每次改动 **1 秒后自动写盘**，无需任何手动操作。
 
 把这个文件放进 **iCloud Drive / 坚果云 / OneDrive / Dropbox 的同步目录**，多台电脑连接同一个文件，即得多设备同步。应用会定时检查文件变化并自动合并。
 
-### 2. WebDAV（手机 + 电脑通用）
+### 3. WebDAV（坚果云等）
 
 设置里填 WebDAV 文件完整地址 + 账号密码，例如坚果云：
 

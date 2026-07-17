@@ -181,11 +181,12 @@ let syncBusy = false, syncQueued = false, syncErr = null, davLastOk = 0;
 const scheduleSync = debounce(() => syncNow(), 1000); /* 设计要求：改动防抖 1s 自动写盘 */
 
 async function syncNow() {
-  if (!fileHandle && !davEnabled()) { updateStatusUi(); return; }
+  if (!fileHandle && !davEnabled() && !cloudEnabled()) { updateStatusUi(); return; }
   if (syncBusy) { syncQueued = true; return; }
   syncBusy = true; syncErr = null; updateStatusUi('busy');
   try {
     if (fileHandle) await fileSyncOnce();
+    if (cloudEnabled()) await gistSyncOnce();
     if (davEnabled()) await davSyncOnce();
   } catch (e) {
     syncErr = (e && e.message) ? e.message : String(e);
@@ -301,6 +302,88 @@ async function davSyncOnce() {
   davLastOk = Date.now();
 }
 
+/* --- 浏览器登录同步：Gitee（国内直连）/ GitHub，数据存账号下的私密代码片段（Gist） --- */
+const LS_CLOUD = 'liuhen.cloud.v1';
+const CLOUD_DESC = '留痕记录数据 liuhen-records（请勿删除 / do not delete）';
+const PROVIDERS = {
+  gitee: {
+    label: 'Gitee 码云', api: 'https://gitee.com/api/v5', authQuery: true,
+    tokenUrl: 'https://gitee.com/profile/personal_access_tokens/new',
+    tokenTip: '私人令牌，只勾选 <b>gists</b> 权限', netTip: '国内手机、电脑直连，无需翻墙'
+  },
+  github: {
+    label: 'GitHub', api: 'https://api.github.com', authQuery: false,
+    tokenUrl: 'https://github.com/settings/tokens/new?scopes=gist&description=liuhen',
+    tokenTip: '经典令牌，只勾选 <b>gist</b> 权限', netTip: '国内直连可能不稳定，适合能访问 GitHub 的环境'
+  }
+};
+function cloudCfg() { try { return JSON.parse(localStorage.getItem(LS_CLOUD)) || null; } catch (e) { return null; } }
+function cloudEnabled() { const c = cloudCfg(); return !!(c && c.token && c.gistId && PROVIDERS[c.provider]); }
+function cloudSave(c) { if (c) localStorage.setItem(LS_CLOUD, JSON.stringify(c)); else localStorage.removeItem(LS_CLOUD); }
+let cloudLastOk = 0;
+function cloudReq(provider, token, path, opts) {
+  const P = PROVIDERS[provider];
+  opts = opts || {};
+  const url = new URL(P.api + path);
+  const headers = Object.assign({}, opts.headers || {});
+  if (P.authQuery) url.searchParams.set('access_token', token);
+  else { headers['Authorization'] = 'Bearer ' + token; headers['Accept'] = 'application/vnd.github+json'; }
+  if (opts.body) headers['Content-Type'] = 'application/json';
+  return fetch(url.toString(), Object.assign({ cache: 'no-store' }, opts, { headers }))
+    .catch(() => { throw new Error('无法连接 ' + P.label + '（检查网络）'); });
+}
+async function cloudLogin(provider, token) {
+  token = (token || '').trim();
+  const P = PROVIDERS[provider];
+  if (!token) throw new Error('请先粘贴' + P.label + '令牌');
+  let login = '';
+  const ru = await cloudReq(provider, token, '/user');
+  if (ru.status === 401) throw new Error('令牌无效或已过期');
+  if (ru.ok) { try { login = (await ru.json()).login || ''; } catch (e) { /* ignore */ } }
+  const rl = await cloudReq(provider, token, '/gists?per_page=100&page=1');
+  if (!rl.ok) throw new Error('令牌缺少 gists 权限（HTTP ' + rl.status + '，创建令牌时请勾选 gists）');
+  const gists = await rl.json();
+  let g = (Array.isArray(gists) ? gists : []).find(x => x.files && x.files['records.json'] && /liuhen/.test(x.description || ''));
+  if (!g) {
+    const rc = await cloudReq(provider, token, '/gists', {
+      method: 'POST',
+      body: JSON.stringify({ description: CLOUD_DESC, public: false, files: { 'records.json': { content: serialize() } } })
+    });
+    if (!rc.ok) throw new Error('创建云端数据失败（HTTP ' + rc.status + '，令牌需要 gists 读写权限）');
+    g = await rc.json();
+  }
+  cloudSave({ provider, token, login, gistId: g.id });
+  syncErr = null;
+  await syncNow();
+}
+function cloudLogout() { cloudSave(null); cloudLastOk = 0; syncErr = null; updateStatusUi(); }
+async function gistSyncOnce() {
+  const c = cloudCfg(); if (!c) return;
+  const P = PROVIDERS[c.provider];
+  const r = await cloudReq(c.provider, c.token, '/gists/' + c.gistId);
+  if (r.status === 401) throw new Error(P.label + ' 令牌失效，请在设置里重新登录');
+  if (r.status === 404) throw new Error('云端数据不存在（代码片段可能被删除），请退出登录后重新登录');
+  if (!r.ok) throw new Error(P.label + ' 读取失败 HTTP ' + r.status);
+  const g = await r.json();
+  const f = g.files && g.files['records.json'];
+  let remote = null;
+  if (f) {
+    let txt = f.content;
+    if (f.truncated && f.raw_url) { const rr = await fetch(f.raw_url, { cache: 'no-store' }); if (rr.ok) txt = await rr.text(); }
+    try { remote = normalize(JSON.parse(txt)); } catch (e) { /* 云端损坏则覆盖 */ }
+  }
+  if (remote) absorbRemote(mergeData(data, remote));
+  if (!remote || canon(remote) !== canon(data) || JSON.stringify(remote.devices) !== JSON.stringify(data.devices)) {
+    const p = await cloudReq(c.provider, c.token, '/gists/' + c.gistId, {
+      method: 'PATCH',
+      body: JSON.stringify({ description: CLOUD_DESC, files: { 'records.json': { content: serialize() } } })
+    });
+    if (!p.ok) throw new Error(P.label + ' 写入失败 HTTP ' + p.status);
+    lastSavedAt = Date.now(); localStorage.setItem('liuhen.savedAt', String(lastSavedAt));
+  }
+  cloudLastOk = Date.now();
+}
+
 /* --- 后台轮询 + 焦点拉取 --- */
 setInterval(async () => {
   if (syncBusy) return;
@@ -311,6 +394,7 @@ setInterval(async () => {
     }
   } catch (e) { /* ignore */ }
   if (davEnabled() && Date.now() - davLastOk > 60000) syncNow();
+  else if (cloudEnabled() && Date.now() - cloudLastOk > 60000) syncNow();
 }, 15000);
 window.addEventListener('focus', () => syncNow());
 document.addEventListener('visibilitychange', () => { if (!document.hidden) syncNow(); });
@@ -357,7 +441,8 @@ const ui = {
   editingId: null,
   revYM: nowYM(), revPeriod: 'month', revFilter: 'all',
   catEditId: null, catPaletteId: null, catAdding: false,
-  sheet: null, sheetEntry: null
+  sheet: null, sheetEntry: null,
+  cloudProv: 'gitee', tokenDraft: ''
 };
 function go(page) { location.hash = '#/' + page; }
 function applyHash() {
@@ -375,6 +460,17 @@ function safeRender() {
   const ae = document.activeElement;
   const typing = ae && ae.closest && ae.closest('#main,#sheet') &&
     (ae.tagName === 'INPUT' || ae.tagName === 'SELECT' || ae.tagName === 'TEXTAREA');
+  if (typing && !ui.editingId && !ui.sheet) {
+    /* 光标停在还没打字的快速记录框里：直接重绘并还回焦点，不阻塞远端更新 */
+    const qids = ['q-note', 'q-min', 'q-metric'];
+    const idle = qids.includes(ae.id) && qids.every(id => { const el = document.getElementById(id); return !el || !el.value; });
+    if (idle) {
+      const fid = ae.id;
+      render();
+      const el = document.getElementById(fid); if (el) el.focus();
+      return;
+    }
+  }
   if (typing || ui.editingId || ui.sheet) { renderQueued = true; return; }
   render();
 }
@@ -403,10 +499,11 @@ function statusText() {
 }
 function syncTargetsLine() {
   const parts = [];
+  if (cloudEnabled()) { const c = cloudCfg(); parts.push(PROVIDERS[c.provider].label + (c.login ? ' · @' + esc(c.login) : ' 已登录')); }
   if (fileInfo) parts.push(`${fileInfo.name} · ${Math.max(1, Math.round(fileInfo.size / 1024))} KB`);
   else if (fileHandle || pendingHandle) parts.push('records.json');
   if (davEnabled()) parts.push('WebDAV');
-  if (!parts.length) parts.push('仅保存在本浏览器');
+  if (!parts.length) parts.push('未登录 · 点击设置同步');
   const n = deviceCount();
   if (n > 1) parts.push(`已同步 ${n} 台设备`);
   return parts.join('<br>');
@@ -877,6 +974,26 @@ function sheetSettingsHtml() {
   <h3>存储与同步</h3>
   <div class="status-ln"><span class="save-line ${st.cls}" style="display:inline-flex"><span class="dot"></span>${st.main}</span><br>${st.sub}</div>
 
+  <h5>浏览器登录同步（推荐）</h5>
+  ${cloudEnabled() ? (() => { const g = cloudCfg(); const P = PROVIDERS[g.provider]; return `
+    <div class="hint">已登录 <b>${P.label}${g.login ? ' · @' + esc(g.login) : ''}</b>。数据保存在你账号下的<b>私密代码片段</b>里，
+    手机、电脑打开本页用同一令牌登录，即可看到同样的数据（约每分钟自动同步，改动后 1 秒内上传）。</div>
+    <div class="btns">
+      <button class="btn dark" data-act="gh-sync">立即同步</button>
+      <button class="btn" data-act="gh-logout">退出登录</button>
+    </div>`; })() : (() => { const P = PROVIDERS[ui.cloudProv]; return `
+    <div class="hint">登录后数据自动存到你自己账号的<b>私密代码片段</b>——换设备打开本页、粘贴同一个令牌登录即可同步，无需服务器。</div>
+    <div class="seg" style="margin:8px 0 10px;display:inline-flex">
+      <button class="${ui.cloudProv === 'gitee' ? 'on' : ''}" data-prov="gitee">Gitee 码云（国内）</button>
+      <button class="${ui.cloudProv === 'github' ? 'on' : ''}" data-prov="github">GitHub</button>
+    </div>
+    <div class="hint">${P.netTip}。<br>
+    <a href="${P.tokenUrl}" target="_blank" rel="noopener">① 点此创建${P.label}令牌 →</a>（${P.tokenTip}）&nbsp;② 生成后复制，粘贴到下框登录。</div>
+    <div class="frow" style="margin-top:8px"><label>${P.label} 令牌（只保存在本设备浏览器里）</label>
+      <input class="line" id="gh-token" type="password" placeholder="粘贴令牌…" autocomplete="off" value="${esc(ui.tokenDraft || '')}"></div>
+    <div class="btns"><button class="btn dark" data-act="gh-login">登录</button></div>
+    <div class="hint" id="gh-msg" style="color:var(--red)"></div>`; })()}
+
   <h5>本地文件（桌面 Chrome / Edge）</h5>
   ${fsSupported() ? `
     <div class="hint">${fileHandle ? `已连接 <b>${esc(fileInfo ? fileInfo.name : 'records.json')}</b>，每次改动后 1 秒自动写盘。` :
@@ -936,6 +1053,12 @@ function sheetEntryHtml() {
 }
 function bindSheet(sheet) {
   sheet.onclick = ev => {
+    const pv = ev.target.closest('[data-prov]');
+    if (pv) {
+      const inp = $('#gh-token', sheet);
+      ui.tokenDraft = inp ? inp.value : ui.tokenDraft;
+      ui.cloudProv = pv.dataset.prov; renderSheet(); return;
+    }
     const t = ev.target.closest('[data-act],[data-cat]');
     if (!t) return;
     if (t.dataset.cat) { /* 编辑弹层里的类别选择 */
@@ -946,6 +1069,17 @@ function bindSheet(sheet) {
     }
     const act = t.dataset.act;
     if (act === 'close') closeSheet();
+    else if (act === 'gh-login') {
+      const inp = $('#gh-token', sheet), msg = $('#gh-msg', sheet);
+      ui.tokenDraft = inp ? inp.value : '';
+      t.disabled = true; t.textContent = '正在登录…'; if (msg) msg.textContent = '';
+      cloudLogin(ui.cloudProv, inp ? inp.value : '').then(() => { ui.tokenDraft = ''; renderSheet(); }).catch(e => {
+        t.disabled = false; t.textContent = '登录';
+        if (msg) msg.textContent = e.message || String(e);
+      });
+    }
+    else if (act === 'gh-logout') { if (confirm('退出登录？本机数据保留，云端数据不会删除。')) { cloudLogout(); renderSheet(); } }
+    else if (act === 'gh-sync') { t.textContent = '同步中…'; syncNow().then(() => renderSheet()); }
     else if (act === 'fs-new') connectFile(true);
     else if (act === 'fs-open') connectFile(false);
     else if (act === 'fs-off') disconnectFile();
@@ -971,6 +1105,10 @@ function bindSheet(sheet) {
   };
   const imp = $('#imp-file', sheet);
   if (imp) imp.onchange = () => { if (imp.files[0]) importBackup(imp.files[0]); };
+  const tok = $('#gh-token', sheet);
+  if (tok) tok.onkeydown = ev => {
+    if (ev.key === 'Enter' && !ev.isComposing) { const b = $('[data-act="gh-login"]', sheet); if (b) b.click(); }
+  };
 }
 function readSheetEntry(sheet) {
   return {
@@ -1143,4 +1281,4 @@ if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
 
 applyHash();
 initFile();
-if (davEnabled()) syncNow();
+if (davEnabled() || cloudEnabled()) syncNow();

@@ -147,6 +147,79 @@ input.line:focus{border-bottom-color:var(--ink)}
 #viewer{position:fixed;inset:0;background:rgba(22,20,17,.92);z-index:60;display:flex;align-items:center;justify-content:center;cursor:zoom-out}
 #viewer img{max-width:94vw;max-height:92vh;border-radius:6px}
 
+/* ---------- 页签 / 足迹 / 筛选 ---------- */
+#tabs{display:flex;align-items:center;gap:8px;margin-bottom:14px}
+#tabs [data-tab]{border:1px solid var(--bd);border-radius:999px;padding:6px 16px;font-size:13px;color:var(--gray);background:transparent}
+#tabs [data-tab].on{background:var(--ink);color:var(--paper);border-color:var(--ink);font-weight:600}
+#tabs [data-tab] i{font-style:normal;font-family:var(--mono);font-size:10.5px;opacity:.65;margin-left:5px}
+.lastseen{margin-left:auto;display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--faint)}
+.ftools{display:flex;gap:8px;align-items:center;margin:16px 0 4px}
+.ftools input{flex:1;min-width:0;border:1px solid var(--bd);border-radius:999px;background:var(--card);padding:6px 14px;font-size:12.5px;outline:none}
+.ftools input:focus{border-color:var(--ink)}
+.ftools select{border:1px solid var(--bd);border-radius:999px;background:var(--card);padding:6px 10px;font-size:12.5px;color:var(--gray);outline:none}
+.ftools #f-clear{font-size:12px;color:var(--red);flex-shrink:0;padding:4px 6px}
+
+/* ---------- 回应贴纸 ---------- */
+.reacts{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
+.reacts .rq{font-size:13px;color:var(--faint);display:inline-flex;align-items:center;gap:4px}
+.reacts .rq.on{color:var(--rose);font-weight:600}
+.reacts .hn{font-size:11px}
+.rpill{display:inline-flex;align-items:center;gap:4px;font-size:12px;border:1px solid var(--line);border-radius:999px;padding:1px 9px;background:var(--paper);color:var(--gray)}
+.rpill.mine{border-color:var(--mist);background:var(--line2)}
+.radd{font-size:13px;color:var(--mist);padding:0 2px}
+.radd:hover{color:var(--gray)}
+.rpal{display:inline-flex;gap:6px;background:var(--card);border:1px solid var(--bd);border-radius:999px;padding:3px 10px}
+.rpal button{font-size:15px;padding:1px 3px}
+
+/* ---------- 便签底色 ---------- */
+.bgs{display:inline-flex;gap:7px;align-items:center;padding-left:10px;border-left:1px solid var(--line)}
+.bgs button{width:17px;height:17px;border-radius:5px;border:1px solid var(--bd);padding:0}
+.bgs button.on{border-color:var(--ink);box-shadow:inset 0 0 0 1.5px var(--paper)}
+.cmp-tools{flex-wrap:wrap}
+.cmp-btns{margin-left:auto;display:inline-flex;gap:6px}
+.cmp-btns .imgbtn{margin-left:0}
+
+/* ---------- 100 件事 ---------- */
+#wadd{display:flex;gap:10px;align-items:center;padding:12px 14px;border:1.5px solid var(--ink);margin-bottom:8px}
+#wadd input{flex:1;min-width:0;border:none;background:transparent;outline:none;font-size:14.5px}
+.wprog{display:flex;align-items:center;gap:14px;font-size:12.5px;color:var(--gray);margin:16px 2px 14px}
+.wprog b{font-family:var(--mono);color:var(--ink)}
+.wbar{flex:1;height:6px;border-radius:999px;background:var(--line2);overflow:hidden}
+.wbar i{display:block;height:100%;border-radius:999px;background:var(--rose);transition:width .4s}
+.wish{display:flex;gap:12px;align-items:flex-start;padding:13px 14px;margin-bottom:8px;border-left:3px solid var(--mist)}
+.wish .wcheck{width:24px;height:24px;border-radius:50%;border:1.5px solid var(--bd);flex-shrink:0;font-size:13px;line-height:1;color:var(--paper);margin-top:1px}
+.wish .wcheck:hover{border-color:var(--green)}
+.wish.wd{border-left-color:var(--green)}
+.wish.wd .wcheck{background:var(--green);border-color:var(--green)}
+.wish.wd .wtext{color:var(--gray);text-decoration:line-through;text-decoration-color:var(--mist)}
+.wish .wbody{flex:1;min-width:0}
+.wish .wtext{font-size:14.5px;line-height:1.6;word-break:break-word}
+.wish .wmeta{font-size:11px;color:var(--faint);margin-top:3px}
+.wish .th-acts{margin-left:0;flex-shrink:0;padding-top:3px}
+.wish .ph{max-width:150px;margin-top:8px}
+.confetti{position:fixed;inset:0;pointer-events:none;z-index:70}
+.confetti i{position:fixed;border-radius:2px;animation:cfly .9s ease-out forwards;opacity:0}
+@keyframes cfly{
+  0%{transform:translate(0,0) rotate(0);opacity:1}
+  100%{transform:translate(var(--dx),var(--dy)) rotate(540deg);opacity:0}
+}
+
+/* ---------- 涂鸦画板 ---------- */
+#doodle{position:fixed;inset:0;background:var(--paper);z-index:55;display:flex;flex-direction:column;align-items:center;padding:14px;gap:12px}
+.dd-top{display:flex;align-items:center;justify-content:space-between;width:100%;max-width:520px}
+.dd-title{font-family:var(--serif);font-weight:900;font-size:18px}
+#dd-cancel{font-size:13px;color:var(--gray)}
+#dd-cv{width:min(92vw,60vh,520px);height:min(92vw,60vh,520px);background:var(--card);border:1px solid var(--bd);border-radius:12px;touch-action:none;cursor:crosshair}
+.dd-bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:center;max-width:520px}
+#dd-colors{display:inline-flex;gap:7px}
+#dd-colors button{width:20px;height:20px;border-radius:50%;border:2px solid transparent;padding:0}
+#dd-colors button.on{border-color:var(--ink);box-shadow:inset 0 0 0 1.5px var(--card)}
+.dd-sizes{display:inline-flex;gap:4px}
+.dd-sizes button{font-size:11.5px;color:var(--gray);border:1px solid var(--bd);border-radius:999px;padding:3px 10px}
+.dd-sizes button.on{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+#dd-undo,#dd-clear{font-size:12px;color:var(--gray);border:1px solid var(--bd);border-radius:999px;padding:4px 12px}
+#dd-done{padding:6px 22px}
+
 /* ---------- 设置弹层 ---------- */
 #mask{position:fixed;inset:0;background:rgba(28,26,23,.32);z-index:40}
 #sheet{position:fixed;z-index:41;background:var(--card);border:1px solid var(--line);
@@ -177,6 +250,17 @@ input.line:focus{border-bottom-color:var(--ink)}
     </div>
   </header>
   <main id="main"></main>
+</div>
+<div id="doodle" hidden>
+  <div class="dd-top"><span class="dd-title">涂鸦一笔</span><button id="dd-cancel">取消</button></div>
+  <canvas id="dd-cv"></canvas>
+  <div class="dd-bar">
+    <span id="dd-colors"></span>
+    <span class="dd-sizes"><button data-ds="3">细</button><button data-ds="7" class="on">中</button><button data-ds="14">粗</button></span>
+    <button id="dd-undo">撤销</button>
+    <button id="dd-clear">清空</button>
+    <button class="btn dark" id="dd-done">完成</button>
+  </div>
 </div>
 <div id="viewer" hidden><img alt=""></div>
 <div id="mask" hidden></div>

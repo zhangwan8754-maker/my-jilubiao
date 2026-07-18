@@ -271,8 +271,13 @@ function cloudReq(provider, token, path, opts) {
   if (P.authQuery) url.searchParams.set('access_token', token);
   else { headers['Authorization'] = 'Bearer ' + token; headers['Accept'] = 'application/vnd.github+json'; }
   if (opts.body) headers['Content-Type'] = 'application/json';
-  return fetch(url.toString(), Object.assign({ cache: 'no-store' }, opts, { headers }))
-    .catch(() => { throw new Error('无法连接 ' + P.label + '（检查网络）'); });
+  const ac = new AbortController(); /* 弱网下不让一个请求挂死同步 */
+  const tm = setTimeout(() => ac.abort(), 20000);
+  return fetch(url.toString(), Object.assign({ cache: 'no-store' }, opts, { headers, signal: ac.signal }))
+    .finally(() => clearTimeout(tm))
+    .catch(e => {
+      throw new Error(e && e.name === 'AbortError' ? P.label + ' 连接超时' : '无法连接 ' + P.label);
+    });
 }
 async function cloudLogin(provider, token) {
   token = (token || '').trim();
@@ -335,12 +340,27 @@ async function gistSyncOnce() {
   cloudLastOk = Date.now();
 }
 const scheduleSync = debounce(() => syncNow(), 800);
+let syncFails = 0; /* 连续失败次数：第 1 次静默快速重试，≥2 次才提示失败 */
+let imgRetryCount = 0;
 async function syncNow() {
   if (!cloudEnabled()) { updateStatusUi(); return; }
   if (syncBusy) { syncQueued = true; return; }
-  syncBusy = true; syncErr = null; updateStatusUi();
-  try { await uploadPendingImages(); await gistSyncOnce(); }
-  catch (e) { syncErr = (e && e.message) ? e.message : String(e); console.warn('sync:', e); }
+  syncBusy = true; updateStatusUi();
+  try {
+    await uploadPendingImages(); /* 单张图失败只记软错误，不抛出、不拦主数据 */
+    await gistSyncOnce();
+    syncFails = 0;
+    syncErr = imgSoftErr;
+    if (imgSoftErr && imgRetryCount < 5) { /* 图片没传上：8 秒后自动补传，连续 5 次后交给常规轮询 */
+      imgRetryCount++;
+      setTimeout(() => { if (!syncBusy) syncNow(); }, 8000);
+    } else if (!imgSoftErr) imgRetryCount = 0;
+  } catch (e) {
+    syncFails++;
+    syncErr = (e && e.message) ? e.message : String(e);
+    console.warn('sync:', e);
+    if (syncFails < 4) setTimeout(() => { if (!syncBusy) syncNow(); }, 3000 * syncFails); /* 3s/6s/9s 快速重试 */
+  }
   syncBusy = false;
   updateStatusUi();
   if (syncQueued) { syncQueued = false; syncNow(); }
@@ -348,7 +368,7 @@ async function syncNow() {
 
 /* ================= 图片：压缩 → 独立私密 Gist（主数据保持轻量） ================= */
 const IMG_DESC = 'us-thoughts-img（想法配图，请勿删除 / do not delete）';
-function compressImage(file) { /* 长边 ≤1280、逐步降质，确保 <700KB，不触发 Gist 截断 */
+function compressImage(file) { /* 长边 ≤1280、逐步降质，压到 500KB 内，上传更稳 */
   return new Promise((res, rej) => {
     const img = new Image();
     img.onload = () => {
@@ -361,8 +381,8 @@ function compressImage(file) { /* 长边 ≤1280、逐步降质，确保 <700KB�
         cv.height = Math.max(1, Math.round(img.naturalHeight * scale));
         cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
         const url = cv.toDataURL('image/jpeg', q);
-        if (url.length > 700 * 1024 && (max > 640 || q > 0.5)) {
-          max = Math.max(640, Math.round(max * 0.8)); q = Math.max(0.5, q - 0.08); attempt();
+        if (url.length > 500 * 1024 && (max > 560 || q > 0.5)) {
+          max = Math.max(560, Math.round(max * 0.8)); q = Math.max(0.5, q - 0.08); attempt();
         } else res({ url, w: cv.width, h: cv.height });
       };
       attempt();
@@ -378,24 +398,56 @@ function discardImage(img) { /* 删除想法/移除配图时清理：本地缓�
     cloudReq(c.provider, c.token, '/gists/' + img.id, { method: 'DELETE' }).catch(() => {});
   }
 }
-async function uploadPendingImages() { /* 待上传的本机图片（想法 + 100 件事）→ 各自建私密 Gist */
+function shrinkDataUrl(url, maxSide, q) { /* 把已压缩的图再压小（上传被拒时降级重试用） */
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
+      const cv = document.createElement('canvas');
+      cv.width = Math.max(1, Math.round(img.naturalWidth * scale));
+      cv.height = Math.max(1, Math.round(img.naturalHeight * scale));
+      cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+      res(cv.toDataURL('image/jpeg', q));
+    };
+    img.onerror = () => rej(new Error('bad image'));
+    img.src = url;
+  });
+}
+const imgTries = new Map();
+let imgSoftErr = null;
+async function uploadPendingImages() { /* 待上传的本机图片（想法 + 100 件事）→ 各自建私密 Gist
+  单张失败只记录、继续下一张，绝不拦住主数据同步 */
+  imgSoftErr = null;
   if (!cloudEnabled()) return;
   const c = cloudCfg();
   for (const t of [...data.thoughts, ...(data.wishes || [])]) {
     if (!t.img || !t.img.pending || t.deleted) continue;
-    const dataUrl = await idbGet('img:' + t.img.id).catch(() => null);
-    if (!dataUrl) { t.img = null; t.updatedAt = Date.now(); saveLocal(); continue; }
-    const r = await cloudReq(c.provider, c.token, '/gists', {
-      method: 'POST',
-      body: JSON.stringify({ description: IMG_DESC, public: false, files: { 'img.txt': { content: dataUrl } } })
-    });
-    if (!r.ok) throw new Error('图片上传失败（HTTP ' + r.status + '）');
-    const gid = (await r.json()).id;
-    await idbSet('img:' + gid, dataUrl).catch(() => {});
-    await idbDel('img:' + t.img.id).catch(() => {});
-    t.img = { id: gid, w: t.img.w, h: t.img.h };
-    t.updatedAt = Date.now();
-    saveLocal();
+    const key = t.img.id;
+    try {
+      const dataUrl = await idbGet('img:' + key);
+      if (!dataUrl) { t.img = null; t.updatedAt = Date.now(); saveLocal(); continue; }
+      const r = await cloudReq(c.provider, c.token, '/gists', {
+        method: 'POST',
+        body: JSON.stringify({ description: IMG_DESC, public: false, files: { 'img.txt': { content: dataUrl } } })
+      });
+      if (!r.ok) {
+        const n = (imgTries.get(key) || 0) + 1; imgTries.set(key, n);
+        if (r.status >= 400 && r.status < 500 && n <= 3) { /* 疑似过大被拒：压更小，下轮再试 */
+          const smaller = await shrinkDataUrl(dataUrl, n === 1 ? 640 : 400, 0.55).catch(() => null);
+          if (smaller && smaller.length < dataUrl.length) await idbSet('img:' + key, smaller).catch(() => {});
+        }
+        throw new Error('有图片上传失败（HTTP ' + r.status + '，会自动重试）');
+      }
+      const gid = (await r.json()).id;
+      imgTries.delete(key);
+      await idbSet('img:' + gid, dataUrl).catch(() => {});
+      await idbDel('img:' + key).catch(() => {});
+      t.img = { id: gid, w: t.img.w, h: t.img.h };
+      t.updatedAt = Date.now();
+      saveLocal();
+    } catch (e) {
+      imgSoftErr = (e && e.message) ? e.message : String(e);
+    }
   }
 }
 async function fetchImage(id) { /* 本地缓存优先，miss 则从 Gist 拉取并缓存 */
@@ -434,8 +486,11 @@ function hydrateImages() { /* 渲染后异步填充图片，只改 DOM 属性，
     }).catch(() => hydrating.delete(id));
   });
 }
-/* 轮询 + 焦点拉取：对方发的想法尽快出现 */
-setInterval(() => { if (cloudEnabled() && !syncBusy && Date.now() - cloudLastOk > 30000) syncNow(); }, 10000);
+/* 轮询 + 焦点拉取：对方发的想法尽快出现；后台页面不轮询（锁屏必失败，白报错） */
+setInterval(() => {
+  if (document.hidden) return;
+  if (cloudEnabled() && !syncBusy && Date.now() - cloudLastOk > 30000) syncNow();
+}, 10000);
 window.addEventListener('focus', () => syncNow());
 document.addEventListener('visibilitychange', () => { if (!document.hidden) syncNow(); });
 
@@ -607,11 +662,12 @@ function seenStr(ts) {
 
 /* --- 状态条 --- */
 function statusText() {
-  if (syncErr) return { cls: 'err', txt: '同步失败', title: syncErr };
   if (syncBusy) return { cls: 'busy', txt: '同步中…', title: '' };
+  if (syncErr && syncFails >= 2) return { cls: 'err', txt: '同步失败', title: syncErr + '（会自动重试）' };
+  if (syncErr && syncFails >= 1) return { cls: 'busy', txt: '重试中…', title: syncErr };
   if (cloudEnabled()) {
     const c = cloudCfg();
-    return { cls: '', txt: '已同步', title: PROVIDERS[c.provider].label + (c.login ? ' · @' + c.login : '') };
+    return { cls: '', txt: '已同步', title: PROVIDERS[c.provider].label + (c.login ? ' · @' + c.login : '') + (syncErr ? ' · ' + syncErr : '') };
   }
   return { cls: 'off', txt: '仅本机', title: '未登录，数据只存在这台设备' };
 }

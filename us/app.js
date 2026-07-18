@@ -98,6 +98,7 @@ const canon = d => JSON.stringify({
   p: Object.entries(d.profiles || {}).sort().map(([k, v]) => [k, v.color, v.updatedAt || 0]),
   t: (d.thoughts || []).slice().sort((a, b) => a.id < b.id ? -1 : 1).map(t => [
     t.id, t.author, t.text, t.ts || 0, t.updatedAt || 0, !!t.deleted,
+    t.textColor || '', t.img ? [t.img.id, !!t.img.pending] : 0,
     Object.entries(t.hearts || {}).sort().map(([k, v]) => [k, !!v.on, v.at || 0]),
     (t.replies || []).slice().sort((a, b) => a.id < b.id ? -1 : 1)
       .map(r => [r.id, r.author, r.text, r.ts || 0, r.updatedAt || 0, !!r.deleted])
@@ -112,6 +113,19 @@ function purgeTombstones() { /* 90 天前的删除墓碑清理，避免无限增
 }
 function serialize() { return JSON.stringify(data, null, 1); }
 function saveLocal() { try { localStorage.setItem(LS_KEY, serialize()); } catch (e) { console.warn(e); } }
+
+/* --- 迷你 IndexedDB：图片缓存（图片不进 localStorage，避免撑爆配额） --- */
+function idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('us', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function idbGet(k) { const db = await idb(); return new Promise((res, rej) => { const t = db.transaction('kv').objectStore('kv').get(k); t.onsuccess = () => res(t.result); t.onerror = () => rej(t.error); }); }
+async function idbSet(k, v) { const db = await idb(); return new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite').objectStore('kv').put(v, k); t.onsuccess = () => res(); t.onerror = () => rej(t.error); }); }
+async function idbDel(k) { const db = await idb(); return new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite').objectStore('kv').delete(k); t.onsuccess = () => res(); t.onerror = () => rej(t.error); }); }
 
 let lastSavedAt = Number(localStorage.getItem('us.savedAt') || 0);
 function commit() {
@@ -133,22 +147,27 @@ function setProfile(name, color) {
   localStorage.setItem(LS_ME, name);
   commit();
 }
-function addThought(text) {
-  text = (text || '').trim(); if (!text) return;
+function addThought(text, img, textColor) {
+  text = (text || '').trim(); if (!text && !img) return;
   data.thoughts.push({
-    id: uuid(), author: me(), text, ts: Date.now(), updatedAt: Date.now(),
+    id: uuid(), author: me(), text, textColor: textColor || '', img: img || null,
+    ts: Date.now(), updatedAt: Date.now(),
     deleted: false, hearts: {}, replies: []
   });
   commit();
 }
-function updateThought(id, text) {
+function updateThought(id, patch) {
   const t = data.thoughts.find(x => x.id === id); if (!t) return;
-  text = (text || '').trim(); if (!text) return;
-  t.text = text; t.updatedAt = Date.now();
+  if (patch.text !== undefined) t.text = patch.text.trim();
+  if (patch.textColor !== undefined) t.textColor = patch.textColor;
+  if (patch.removeImg && t.img) { discardImage(t.img); t.img = null; }
+  if (!t.text && !t.img) { t.deleted = true; } /* 文字图片都没了 = 删除 */
+  t.updatedAt = Date.now();
   commit();
 }
 function deleteThought(id) {
   const t = data.thoughts.find(x => x.id === id); if (!t) return;
+  if (t.img) { discardImage(t.img); t.img = null; }
   t.deleted = true; t.updatedAt = Date.now(); commit();
 }
 function toggleHeart(id) {
@@ -262,11 +281,100 @@ async function syncNow() {
   if (!cloudEnabled()) { updateStatusUi(); return; }
   if (syncBusy) { syncQueued = true; return; }
   syncBusy = true; syncErr = null; updateStatusUi();
-  try { await gistSyncOnce(); }
+  try { await uploadPendingImages(); await gistSyncOnce(); }
   catch (e) { syncErr = (e && e.message) ? e.message : String(e); console.warn('sync:', e); }
   syncBusy = false;
   updateStatusUi();
   if (syncQueued) { syncQueued = false; syncNow(); }
+}
+
+/* ================= 图片：压缩 → 独立私密 Gist（主数据保持轻量） ================= */
+const IMG_DESC = 'us-thoughts-img（想法配图，请勿删除 / do not delete）';
+function compressImage(file) { /* 长边 ≤1280、逐步降质，确保 <700KB，不触发 Gist 截断 */
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(img.src);
+      let max = 1280, q = 0.82;
+      const attempt = () => {
+        const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+        const cv = document.createElement('canvas');
+        cv.width = Math.max(1, Math.round(img.naturalWidth * scale));
+        cv.height = Math.max(1, Math.round(img.naturalHeight * scale));
+        cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+        const url = cv.toDataURL('image/jpeg', q);
+        if (url.length > 700 * 1024 && (max > 640 || q > 0.5)) {
+          max = Math.max(640, Math.round(max * 0.8)); q = Math.max(0.5, q - 0.08); attempt();
+        } else res({ url, w: cv.width, h: cv.height });
+      };
+      attempt();
+    };
+    img.onerror = () => rej(new Error('无法读取这张图片'));
+    img.src = URL.createObjectURL(file);
+  });
+}
+function discardImage(img) { /* 删除想法/移除配图时清理：本地缓存 + 云端 Gist（尽力而为） */
+  idbDel('img:' + img.id).catch(() => {});
+  if (!img.pending && cloudEnabled()) {
+    const c = cloudCfg();
+    cloudReq(c.provider, c.token, '/gists/' + img.id, { method: 'DELETE' }).catch(() => {});
+  }
+}
+async function uploadPendingImages() { /* 待上传的本机图片 → 各自建私密 Gist */
+  if (!cloudEnabled()) return;
+  const c = cloudCfg();
+  for (const t of data.thoughts) {
+    if (!t.img || !t.img.pending || t.deleted) continue;
+    const dataUrl = await idbGet('img:' + t.img.id).catch(() => null);
+    if (!dataUrl) { t.img = null; t.updatedAt = Date.now(); saveLocal(); continue; }
+    const r = await cloudReq(c.provider, c.token, '/gists', {
+      method: 'POST',
+      body: JSON.stringify({ description: IMG_DESC, public: false, files: { 'img.txt': { content: dataUrl } } })
+    });
+    if (!r.ok) throw new Error('图片上传失败（HTTP ' + r.status + '）');
+    const gid = (await r.json()).id;
+    await idbSet('img:' + gid, dataUrl).catch(() => {});
+    await idbDel('img:' + t.img.id).catch(() => {});
+    t.img = { id: gid, w: t.img.w, h: t.img.h };
+    t.updatedAt = Date.now();
+    saveLocal();
+  }
+}
+async function fetchImage(id) { /* 本地缓存优先，miss 则从 Gist 拉取并缓存 */
+  const hit = await idbGet('img:' + id).catch(() => null);
+  if (hit) return hit;
+  if (id.charAt(0) === 'l' || !cloudEnabled()) return null; /* 待上传的图只有作者设备有 */
+  const c = cloudCfg();
+  const r = await cloudReq(c.provider, c.token, '/gists/' + id).catch(() => null);
+  if (!r || !r.ok) return null;
+  const g = await r.json();
+  const f = g.files && g.files['img.txt'];
+  if (!f) return null;
+  let txt = f.content;
+  if ((!txt || f.truncated) && f.raw_url) {
+    const u = new URL(f.raw_url);
+    if (PROVIDERS[c.provider].authQuery) u.searchParams.set('access_token', c.token);
+    const rr = await fetch(u.toString(), { cache: 'no-store' }).catch(() => null);
+    if (rr && rr.ok) txt = await rr.text();
+  }
+  if (txt && /^data:image\//.test(txt)) { await idbSet('img:' + id, txt).catch(() => {}); return txt; }
+  return null;
+}
+const hydrating = new Set();
+function hydrateImages() { /* 渲染后异步填充图片，只改 DOM 属性，不打断输入 */
+  $$('.ph[data-gist]').forEach(el => {
+    const id = el.dataset.gist;
+    if (el.dataset.done || hydrating.has(id)) return;
+    hydrating.add(id);
+    fetchImage(id).then(url => {
+      hydrating.delete(id);
+      $$(`.ph[data-gist="${id}"]`).forEach(el2 => {
+        if (el2.dataset.done) return;
+        if (url) { el2.dataset.done = '1'; el2.classList.add('ld'); el2.innerHTML = `<img src="${url}" alt="">`; }
+        else { const s = $('span', el2); if (s) s.textContent = el2.dataset.pending ? '图片同步中，等 TA 的设备在线…' : '图片加载失败，稍后自动重试'; }
+      });
+    }).catch(() => hydrating.delete(id));
+  });
 }
 /* 轮询 + 焦点拉取：对方发的想法尽快出现 */
 setInterval(() => { if (cloudEnabled() && !syncBusy && Date.now() - cloudLastOk > 30000) syncNow(); }, 10000);
@@ -299,12 +407,15 @@ function importBackup(file) {
 }
 
 /* ================= UI ================= */
+const TC = ['#1C1A17', '#C0502C', '#B04A5A', '#33587A', '#4A7051', '#B07C2A', '#7A4A6F', '#2C7A8C']; /* 字体颜色，首个为默认墨色 */
 const ui = {
   gate: null,           /* null=自动 | 'setup' | 'who' 强制显示某个门 */
   cloudProv: 'gitee', tokenDraft: '', gateErr: '', gateBusy: false,
   whoName: '', whoColor: '',
   draft: '',            /* 想法输入框草稿，跨渲染保留 */
-  editingId: null, editDraft: '',
+  cmpColor: localStorage.getItem('us.tc.v1') || TC[0],
+  cmpImg: null,         /* 待发布配图 {url,w,h} */
+  editingId: null, editDraft: '', editColor: TC[0], editRemoveImg: false,
   replyTo: null, replyDraft: '',
   actsOn: null,         /* 手机上点开操作按钮的卡片 */
   sheet: false
@@ -409,6 +520,15 @@ function heartLine(t) {
   return `<button class="heart ${mine ? 'on' : ''}" data-act="heart">${mine ? '♥' : '♡'}${
     who.length ? ` <span class="hn">${who.map(esc).join(' · ')}</span>` : ''}</button>`;
 }
+function tcsHtml(cls, cur) {
+  return `<span class="tcs ${cls}">${TC.map(c =>
+    `<button data-tc="${c}" class="${cur === c ? 'on' : ''}" style="background:${c}" aria-label="字体颜色 ${c}"></button>`).join('')}</span>`;
+}
+function imgBlock(t) {
+  if (!t.img) return '';
+  const ar = (t.img.w && t.img.h) ? ` style="aspect-ratio:${t.img.w}/${t.img.h}"` : '';
+  return `<div class="ph" data-gist="${esc(t.img.id)}"${t.img.pending ? ' data-pending="1"' : ''}${ar}><span>图片加载中…</span></div>`;
+}
 function thoughtHtml(t) {
   const c = colorOf(t.author);
   const editing = ui.editingId === t.id;
@@ -423,10 +543,13 @@ function thoughtHtml(t) {
     </div>
     ${editing ? `
     <div class="edit-box">
-      <textarea id="edit-ta">${esc(ui.editDraft)}</textarea>
+      <textarea id="edit-ta" style="color:${ui.editColor}">${esc(ui.editDraft)}</textarea>
+      ${t.img && !ui.editRemoveImg ? `<div class="cmp-prev edit-img">${imgBlock(t)}<button class="px" data-act="edit-img-x" title="移除图片">✕</button></div>` : ''}
+      <div class="cmp-tools">${tcsHtml('edit-tcs', ui.editColor)}</div>
       <div class="edit-acts"><button class="btn" data-act="edit-cancel">取消</button><button class="btn dark" data-act="edit-save">保存</button></div>
     </div>` : `
-    <div class="th-text">${esc(t.text)}</div>
+    ${t.text ? `<div class="th-text"${t.textColor ? ` style="color:${esc(t.textColor)}"` : ''}>${esc(t.text)}</div>` : ''}
+    ${imgBlock(t)}
     <div class="th-foot">
       ${heartLine(t)}
       <button data-act="reply-open">回复${replies.length ? ' ' + replies.length : ''}</button>
@@ -457,7 +580,13 @@ function vMain() {
   }
   return `
   <div class="card" id="composer">
-    <textarea id="cmp" placeholder="此刻的小想法…" rows="2">${esc(ui.draft)}</textarea>
+    <textarea id="cmp" placeholder="此刻的小想法…" rows="2" style="color:${ui.cmpColor}">${esc(ui.draft)}</textarea>
+    ${ui.cmpImg ? `<div class="cmp-prev"><img src="${ui.cmpImg.url}" alt=""><button class="px" id="cmp-img-x" title="移除图片">✕</button></div>` : ''}
+    <div class="cmp-tools">
+      ${tcsHtml('cmp-tcs', ui.cmpColor)}
+      <button class="imgbtn" id="cmp-imgbtn">📷 图片</button>
+      <input type="file" id="cmp-file" accept="image/*" hidden>
+    </div>
     <div class="cmp-foot">
       <span class="me-chip"><span class="dot8" style="background:${myColor}"></span>${esc(me())}</span>
       <span class="cmp-hint">Ctrl + Enter 发布</span>
@@ -517,6 +646,7 @@ function render() {
   $('#main').innerHTML = ({ setup: vSetup, who: vWho, main: vMain })[view()]();
   const cmp = $('#cmp');
   if (cmp) autosize(cmp);
+  hydrateImages();
   updateStatusUi();
   if (ui.sheet) renderSheet();
 }
@@ -552,12 +682,24 @@ async function doLogin() {
   }
   render();
 }
-function doPublish() {
+async function doPublish() {
   const cmp = $('#cmp'); if (!cmp) return;
-  const text = cmp.value.trim(); if (!text) return;
-  ui.draft = '';
-  addThought(text);
+  const text = cmp.value.trim();
+  if (!text && !ui.cmpImg) return;
+  let img = null;
+  if (ui.cmpImg) { /* 图片先落本机 IndexedDB，同步时自动上传成独立 Gist */
+    const id = 'l' + uuid();
+    try { await idbSet('img:' + id, ui.cmpImg.url); } catch (e) { alert('图片保存失败：' + e.message); return; }
+    img = { id, w: ui.cmpImg.w, h: ui.cmpImg.h, pending: true };
+  }
+  ui.draft = ''; ui.cmpImg = null;
+  addThought(text, img, ui.cmpColor === TC[0] ? '' : ui.cmpColor);
   const c2 = $('#cmp'); if (c2) c2.focus();
+}
+async function pickImage(file) {
+  if (!file) return;
+  try { ui.cmpImg = await compressImage(file); render(); }
+  catch (e) { alert(e.message); }
 }
 $('#main').addEventListener('click', e => {
   const v = view();
@@ -581,6 +723,30 @@ $('#main').addEventListener('click', e => {
   if (v !== 'main') return;
   /* 想法流 */
   if (e.target.id === 'cmp-send') { doPublish(); return; }
+  if (e.target.id === 'cmp-imgbtn') { $('#cmp-file').click(); return; }
+  if (e.target.id === 'cmp-img-x') { ui.cmpImg = null; render(); return; }
+  /* 字体颜色：只改状态和样式，不整页重绘，避免打断输入 */
+  const tc = e.target.closest('[data-tc]');
+  if (tc) {
+    const color = tc.dataset.tc;
+    if (tc.closest('.cmp-tcs')) {
+      ui.cmpColor = color; localStorage.setItem('us.tc.v1', color);
+      const ta = $('#cmp'); if (ta) ta.style.color = color;
+      $$('.cmp-tcs [data-tc]').forEach(b => b.classList.toggle('on', b.dataset.tc === color));
+    } else {
+      ui.editColor = color;
+      const ta = $('#edit-ta'); if (ta) ta.style.color = color;
+      $$('.edit-tcs [data-tc]').forEach(b => b.classList.toggle('on', b.dataset.tc === color));
+    }
+    return;
+  }
+  /* 点图片 → 全屏查看 */
+  const ph = e.target.closest('.ph.ld');
+  if (ph && !e.target.closest('.edit-img')) {
+    const im = $('img', ph);
+    if (im && im.src) { $('#viewer img').src = im.src; $('#viewer').hidden = false; }
+    return;
+  }
   const card = e.target.closest('.th');
   const act = e.target.closest('[data-act]');
   if (!card) return;
@@ -613,22 +779,34 @@ $('#main').addEventListener('click', e => {
     }
     case 'edit':
       ui.editingId = id; ui.editDraft = t ? t.text : '';
+      ui.editColor = (t && t.textColor) || TC[0]; ui.editRemoveImg = false;
       render();
       { const ta = $('#edit-ta'); if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } }
       break;
+    case 'edit-img-x': ui.editRemoveImg = true; render(); break;
     case 'edit-save': {
       const ta = $('#edit-ta');
       const txt = ta ? ta.value.trim() : '';
-      ui.editingId = null; ui.editDraft = '';
-      if (txt && t && txt !== t.text) updateThought(id, txt); else render();
+      const keepImg = t && t.img && !ui.editRemoveImg;
+      const removeImg = ui.editRemoveImg;
+      ui.editingId = null; ui.editDraft = ''; ui.editRemoveImg = false;
+      if (!t || (!txt && !keepImg)) { render(); break; } /* 什么都不剩就不保存 */
+      updateThought(id, { text: txt, textColor: ui.editColor === TC[0] ? '' : ui.editColor, removeImg });
       break;
     }
-    case 'edit-cancel': ui.editingId = null; ui.editDraft = ''; render(); break;
+    case 'edit-cancel': ui.editingId = null; ui.editDraft = ''; ui.editRemoveImg = false; render(); break;
     case 'del':
       if (confirm('删除这条想法？双方都将看不到。')) deleteThought(id);
       break;
   }
 });
+$('#main').addEventListener('change', e => {
+  if (e.target.id === 'cmp-file' && e.target.files && e.target.files[0]) {
+    pickImage(e.target.files[0]);
+    e.target.value = '';
+  }
+});
+$('#viewer').addEventListener('click', () => { $('#viewer').hidden = true; $('#viewer img').src = ''; });
 $('#main').addEventListener('input', e => {
   if (e.target.id === 'cmp') { ui.draft = e.target.value; autosize(e.target); }
   if (e.target.id === 'edit-ta') ui.editDraft = e.target.value;
@@ -641,13 +819,7 @@ $('#main').addEventListener('keydown', e => {
   if (e.target.id === 'cmp' && e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doPublish(); }
   if (e.target.id === 'edit-ta' && e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
     e.preventDefault();
-    const card = e.target.closest('.th');
-    if (card) {
-      const txt = e.target.value.trim();
-      const t = data.thoughts.find(x => x.id === card.dataset.id);
-      ui.editingId = null; ui.editDraft = '';
-      if (txt && t && txt !== t.text) updateThought(card.dataset.id, txt); else render();
-    }
+    const b = $('[data-act="edit-save"]'); if (b) b.click();
   }
   if (e.target.id === 'reply-in' && e.key === 'Enter') {
     e.preventDefault();

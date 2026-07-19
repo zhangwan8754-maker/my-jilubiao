@@ -124,6 +124,15 @@ function purgeTombstones() { /* 90 天前的删除墓碑清理，避免无限增
   }
 }
 function serialize() { return JSON.stringify(data, null, 1); }
+/* 上传给 Gitee 的内容转成纯 ASCII：把非 ASCII（emoji、中文等）写成 \uXXXX。
+   Gitee 的数据库字段是老的 utf8（非 utf8mb4），存不了 4 字节 emoji（🫂😂😘…），
+   直接写会 HTTP 400 Mysql2 Incorrect string value 拒收整份数据、连累全部同步。
+   读回来时 JSON.parse 会自动还原，界面显示不受影响。 */
+function cloudContent() {
+  return serialize().replace(/[\u0080-\uffff]/g, function (c) {
+    return '\\u' + ('0000' + c.charCodeAt(0).toString(16)).slice(-4);
+  });
+}
 function saveLocal() { try { localStorage.setItem(LS_KEY, serialize()); } catch (e) { console.warn(e); } }
 
 /* --- 迷你 IndexedDB：图片缓存（图片不进 localStorage，避免撑爆配额） --- */
@@ -316,7 +325,7 @@ async function cloudLogin(provider, token) {
   if (!g) {
     const rc = await cloudReq(provider, token, '/gists', {
       method: 'POST',
-      body: JSON.stringify({ description: CLOUD_DESC, public: false, files: { 'us-thoughts.json': { content: serialize() } } })
+      body: JSON.stringify({ description: CLOUD_DESC, public: false, files: { 'us-thoughts.json': { content: cloudContent() } } })
     });
     if (!rc.ok) throw new Error('创建云端数据失败（HTTP ' + rc.status + '，令牌需要 gists 读写权限）');
     g = await rc.json();
@@ -361,7 +370,7 @@ async function gistSyncOnce() {
     }
     const p = await cloudReq(c.provider, c.token, '/gists/' + c.gistId, {
       method: 'PATCH',
-      body: JSON.stringify({ description: CLOUD_DESC, files: { 'us-thoughts.json': { content: serialize() } } })
+      body: JSON.stringify({ description: CLOUD_DESC, files: { 'us-thoughts.json': { content: cloudContent() } } })
     });
     if (!p.ok) throw httpErr(P, '写入', p.status, await p.text().catch(() => ''));
     lastPatchAt = Date.now();

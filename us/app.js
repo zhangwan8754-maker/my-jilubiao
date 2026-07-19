@@ -262,6 +262,28 @@ function cloudCfg() { try { return JSON.parse(localStorage.getItem(LS_CLOUD)) ||
 function cloudEnabled() { const c = cloudCfg(); return !!(c && c.token && c.gistId && PROVIDERS[c.provider]); }
 function cloudSave(c) { if (c) localStorage.setItem(LS_CLOUD, JSON.stringify(c)); else localStorage.removeItem(LS_CLOUD); }
 let cloudLastOk = 0, syncBusy = false, syncQueued = false, syncErr = null;
+let rateLimitUntil = 0; /* 被 403 限流后的自动退避截止时间 */
+let lastPatchAt = 0;    /* 上次写入云端的时间，用于写入节流 */
+
+/* 同步错误日志（最近 6 条，持久化）：手机上看不到悬停提示，靠它定位问题 */
+const LS_SLOG = 'us.synclog.v1';
+function slog() { try { return JSON.parse(localStorage.getItem(LS_SLOG)) || []; } catch (e) { return []; } }
+function slogPush(m) {
+  m = String(m).slice(0, 140);
+  const l = slog();
+  if (l[0] && l[0].m === m) { l[0].t = Date.now(); l[0].n = (l[0].n || 1) + 1; }
+  else l.unshift({ t: Date.now(), m, n: 1 });
+  try { localStorage.setItem(LS_SLOG, JSON.stringify(l.slice(0, 6))); } catch (e) { /* ignore */ }
+}
+function httpErr(P, verb, status, body) { /* 把 HTTP 状态翻译成能看懂的话，带上服务端原话方便定位 */
+  let msg = '';
+  try { msg = (JSON.parse(body || '') || {}).message || ''; } catch (e) { msg = String(body || '').slice(0, 60); }
+  const tail = msg ? '：' + String(msg).slice(0, 60) : '';
+  if (status === 401) return new Error(P.label + ' 令牌失效或已过期 → 请在设置里退出后重新登录');
+  if (status === 403) { rateLimitUntil = Date.now() + 90e3; return new Error('被 ' + P.label + ' 限频（403' + tail + '），已自动减速，约 1 分钟后恢复'); }
+  if (status === 404) return new Error('云端数据不存在（代码片段可能被删除）→ 请退出后重新登录');
+  return new Error(P.label + ' ' + verb + '失败 HTTP ' + status + tail);
+}
 
 function cloudReq(provider, token, path, opts) {
   const P = PROVIDERS[provider];
@@ -313,9 +335,7 @@ async function gistSyncOnce() {
   const c = cloudCfg(); if (!c) return;
   const P = PROVIDERS[c.provider];
   const r = await cloudReq(c.provider, c.token, '/gists/' + c.gistId);
-  if (r.status === 401) throw new Error(P.label + ' 令牌失效，请在设置里重新登录');
-  if (r.status === 404) throw new Error('云端数据不存在（代码片段可能被删除），请退出后重新登录');
-  if (!r.ok) throw new Error(P.label + ' 读取失败 HTTP ' + r.status);
+  if (!r.ok) throw httpErr(P, '读取', r.status, await r.text().catch(() => ''));
   const g = await r.json();
   const f = g.files && g.files['us-thoughts.json'];
   let remote = null;
@@ -329,12 +349,22 @@ async function gistSyncOnce() {
   data.devices[deviceId()] = { name: deviceName(), me: me(), t: Date.now() };
   const myRemoteDev = remote && remote.devices && remote.devices[deviceId()];
   const heartbeat = !myRemoteDev || Date.now() - (myRemoteDev.t || 0) > 10 * 60e3;
-  if (!remote || canon(remote) !== canon(data) || heartbeat) {
+  const contentChanged = !remote || canon(remote) !== canon(data);
+  if (contentChanged || heartbeat) {
+    /* 写入节流：Gitee 对连续写入限频很严，内容改动两次上传至少间隔 8 秒；
+       没到点的改动先存本地、到点自动补传，绝不当成失败。心跳每 10 分钟一次不受限。 */
+    const since = Date.now() - lastPatchAt;
+    if (contentChanged && since < 5000) {
+      cloudLastOk = Date.now();
+      setTimeout(() => { if (!syncBusy) syncNow(); }, 5000 - since + 300);
+      return;
+    }
     const p = await cloudReq(c.provider, c.token, '/gists/' + c.gistId, {
       method: 'PATCH',
       body: JSON.stringify({ description: CLOUD_DESC, files: { 'us-thoughts.json': { content: serialize() } } })
     });
-    if (!p.ok) throw new Error(P.label + ' 写入失败 HTTP ' + p.status);
+    if (!p.ok) throw httpErr(P, '写入', p.status, await p.text().catch(() => ''));
+    lastPatchAt = Date.now();
     lastSavedAt = Date.now(); localStorage.setItem('us.savedAt', String(lastSavedAt));
   }
   cloudLastOk = Date.now();
@@ -358,8 +388,12 @@ async function syncNow() {
   } catch (e) {
     syncFails++;
     syncErr = (e && e.message) ? e.message : String(e);
+    slogPush(syncErr);
     console.warn('sync:', e);
-    if (syncFails < 4) setTimeout(() => { if (!syncBusy) syncNow(); }, 3000 * syncFails); /* 3s/6s/9s 快速重试 */
+    /* 被限流时不做密集快速重试，否则越限越死 */
+    if (syncFails < 4 && Date.now() >= rateLimitUntil) {
+      setTimeout(() => { if (!syncBusy) syncNow(); }, 3000 * syncFails); /* 3s/6s/9s 快速重试 */
+    }
   }
   syncBusy = false;
   updateStatusUi();
@@ -425,14 +459,18 @@ async function uploadPendingImages() { /* 待上传的本机图片（想法 + 10
     const key = t.img.id;
     try {
       const dataUrl = await idbGet('img:' + key);
-      if (!dataUrl) { t.img = null; t.updatedAt = Date.now(); saveLocal(); continue; }
+      /* 关键：pending 图的原始数据只存在「发图那台设备」上。别的设备找不到 blob
+         时必须原样跳过——绝不能把它清空（那会用更新的时间戳覆盖、抹掉对方还没传完的图，
+         并引发反复同步）。等发图设备自己传完，img.id 变成 g... 大家就都能看到了。 */
+      if (!dataUrl) continue;
       const r = await cloudReq(c.provider, c.token, '/gists', {
         method: 'POST',
         body: JSON.stringify({ description: IMG_DESC, public: false, files: { 'img.txt': { content: dataUrl } } })
       });
       if (!r.ok) {
+        if (r.status === 403) rateLimitUntil = Date.now() + 5 * 60e3; /* 限流同样退避 */
         const n = (imgTries.get(key) || 0) + 1; imgTries.set(key, n);
-        if (r.status >= 400 && r.status < 500 && n <= 3) { /* 疑似过大被拒：压更小，下轮再试 */
+        if ((r.status === 400 || r.status === 413 || r.status === 422) && n <= 3) { /* 疑似过大被拒：压更小，下轮再试 */
           const smaller = await shrinkDataUrl(dataUrl, n === 1 ? 640 : 400, 0.55).catch(() => null);
           if (smaller && smaller.length < dataUrl.length) await idbSet('img:' + key, smaller).catch(() => {});
         }
@@ -447,6 +485,7 @@ async function uploadPendingImages() { /* 待上传的本机图片（想法 + 10
       saveLocal();
     } catch (e) {
       imgSoftErr = (e && e.message) ? e.message : String(e);
+      slogPush(imgSoftErr);
     }
   }
 }
@@ -471,24 +510,27 @@ async function fetchImage(id) { /* 本地缓存优先，miss 则从 Gist 拉取�
   return null;
 }
 const hydrating = new Set();
+const imgFailAt = new Map(); /* 拉取失败的图：冷却 60 秒再重试，避免每次渲染都轰炸 Gitee */
 function hydrateImages() { /* 渲染后异步填充图片，只改 DOM 属性，不打断输入 */
   $$('.ph[data-gist]').forEach(el => {
     const id = el.dataset.gist;
     if (el.dataset.done || hydrating.has(id)) return;
+    if (Date.now() - (imgFailAt.get(id) || 0) < 60000) return; /* 冷却中，先不重试 */
     hydrating.add(id);
     fetchImage(id).then(url => {
       hydrating.delete(id);
+      if (url) imgFailAt.delete(id); else imgFailAt.set(id, Date.now());
       $$(`.ph[data-gist="${id}"]`).forEach(el2 => {
         if (el2.dataset.done) return;
         if (url) { el2.dataset.done = '1'; el2.classList.add('ld'); el2.innerHTML = `<img src="${url}" alt="">`; }
-        else { const s = $('span', el2); if (s) s.textContent = el2.dataset.pending ? '图片同步中，等 TA 的设备在线…' : '图片加载失败，稍后自动重试'; }
+        else { const s = $('span', el2); if (s) s.textContent = el2.dataset.pending ? '图片同步中，等 TA 的设备在线…' : '图片加载中，稍后自动重试'; }
       });
-    }).catch(() => hydrating.delete(id));
+    }).catch(() => { hydrating.delete(id); imgFailAt.set(id, Date.now()); });
   });
 }
-/* 轮询 + 焦点拉取：对方发的想法尽快出现；后台页面不轮询（锁屏必失败，白报错） */
+/* 轮询 + 焦点拉取：对方发的想法尽快出现；后台不轮询（锁屏必失败），限流期间暂停 */
 setInterval(() => {
-  if (document.hidden) return;
+  if (document.hidden || Date.now() < rateLimitUntil) return;
   if (cloudEnabled() && !syncBusy && Date.now() - cloudLastOk > 30000) syncNow();
 }, 10000);
 window.addEventListener('focus', () => syncNow());
@@ -905,7 +947,15 @@ function sheetHtml() {
       : `<span class="save-line off"><span class="dot"></span>仅本机</span>
          <button class="btn dark" data-act="login">登录同步</button>`}
   </span></div>
-  ${syncErr ? `<div class="kv"><span class="k" style="color:var(--red)">同步错误</span><span class="v" style="font-weight:400;font-size:12px;color:var(--red);text-align:right">${esc(syncErr)}</span></div>` : ''}
+  ${cloudEnabled() ? `
+  <div class="kv"><span class="k">同步状态</span><span class="v" style="font-weight:400;font-size:12px;text-align:right">
+    ${syncBusy ? '同步中…' : cloudLastOk ? '上次成功 ' + seenStr(cloudLastOk) : '尚未成功'}
+    <button class="btn" data-act="syncnow">立即同步</button>
+  </span></div>
+  ${rateLimitUntil > Date.now() ? `<div class="kv"><span class="k" style="color:var(--red)">限频中</span><span class="v" style="font-weight:400;font-size:12px;color:var(--red)">约 ${Math.ceil((rateLimitUntil - Date.now()) / 1000)} 秒后自动恢复</span></div>` : ''}
+  ${slog().length ? `<div class="kv" style="align-items:flex-start"><span class="k">最近错误</span><span class="v" style="font-weight:400;font-size:11px;color:var(--gray);text-align:right;line-height:1.7;max-width:72%">
+    ${slog().map(e => `${seenStr(e.t)}${e.n > 1 ? ` ×${e.n}` : ''}：${esc(e.m)}`).join('<br>')}
+  </span></div>` : ''}` : ''}
   <div class="kv"><span class="k">我的身份</span><span class="v">
     <span class="dot8" style="background:${myColor}"></span>${esc(me() || '未设置')}
     <button class="btn" data-act="switch-who">切换</button>
@@ -1213,6 +1263,8 @@ $('#main').addEventListener('keydown', e => {
 
 /* 设置弹层 */
 $('#btn-gear').addEventListener('click', () => { ui.sheet = true; renderSheet(); });
+$('#st-chip').addEventListener('click', () => { ui.sheet = true; renderSheet(); }); /* 点状态点 → 看同步详情/错误 */
+$('#st-chip').style.cursor = 'pointer';
 $('#mask').addEventListener('click', () => { ui.sheet = false; renderSheet(); });
 $('#sheet').addEventListener('click', e => {
   const act = e.target.closest('[data-act]');
@@ -1228,6 +1280,11 @@ $('#sheet').addEventListener('click', e => {
     case 'switch-who': ui.sheet = false; ui.gate = 'who'; renderSheet(); render(); break;
     case 'export': exportBackup(); break;
     case 'import': $('#imp-file').click(); break;
+    case 'syncnow':
+      syncFails = 0; rateLimitUntil = 0; imgRetryCount = 0; imgTries.clear();
+      syncNow().then(() => renderSheet());
+      renderSheet();
+      break;
   }
 });
 $('#sheet').addEventListener('change', e => {

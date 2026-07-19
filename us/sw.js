@@ -1,5 +1,5 @@
 /* 我们的小想法 Service Worker：应用壳缓存 + 字体运行时缓存（离线可用） */
-const VER = 'us-v2';
+const VER = 'us-v3';
 const RT = 'us-rt-v1';
 const CORE = ['./', './index.html', './app.js', './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png'];
 

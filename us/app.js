@@ -24,9 +24,18 @@ const LS_DEV = 'us.dev.v1';
 const LS_CLOUD = 'us.cloud.v1';
 const LS_LOCAL = 'us.localonly.v1'; /* 「先本机试用」标记 */
 const PALETTE = ['#C0502C', '#B04A5A', '#33587A', '#4A7051', '#B07C2A', '#7A4A6F', '#2C7A8C', '#5B6B2C'];
+/* 随心选默认分类：固定 id + updatedAt:0，任何真实编辑/删除（带真时间戳）都会盖过它 */
+const PICK_EMOJIS = ['🧋', '🍚', '🤖', '🎾', '💕', '🎬', '🎁', '🍜', '🎲', '✨'];
+const DEFAULT_PICKS = [
+  { id: 'pk-tea', name: '奶茶', emoji: '🧋', color: '#B07C2A', options: ['蜜雪', '喜茶', 'CoCo', '益禾堂', '古茗'], order: 0, updatedAt: 0, deleted: false },
+  { id: 'pk-food', name: '饭店', emoji: '🍚', color: '#C0502C', options: ['平价饭店', '漂亮饭店', '小吃饭店'], order: 1, updatedAt: 0, deleted: false },
+  { id: 'pk-ai', name: 'AI', emoji: '🤖', color: '#33587A', options: ['ChatGPT', 'Claude', 'Kimi', '豆包'], order: 2, updatedAt: 0, deleted: false },
+  { id: 'pk-sport', name: '娱乐运动', emoji: '🎾', color: '#4A7051', options: ['网球', '羽毛球', '健身', '演唱会', '旅行'], order: 3, updatedAt: 0, deleted: false },
+  { id: 'pk-date', name: '约会', emoji: '💕', color: '#B04A5A', options: ['散步', '逛街', '逛公园', '骑行'], order: 4, updatedAt: 0, deleted: false }
+];
 
 function freshData() {
-  return { app: 'us-thoughts', version: 1, profiles: {}, thoughts: [], wishes: [], devices: {} };
+  return { app: 'us-thoughts', version: 1, profiles: {}, thoughts: [], wishes: [], picks: JSON.parse(JSON.stringify(DEFAULT_PICKS)), devices: {} };
 }
 function normalize(d) {
   if (!d || typeof d !== 'object') return null;
@@ -34,6 +43,7 @@ function normalize(d) {
   out.profiles = (d.profiles && typeof d.profiles === 'object') ? d.profiles : {};
   out.thoughts = Array.isArray(d.thoughts) ? d.thoughts.filter(t => t && t.id) : [];
   out.wishes = Array.isArray(d.wishes) ? d.wishes.filter(w => w && w.id) : [];
+  out.picks = Array.isArray(d.picks) ? d.picks.filter(p => p && p.id) : JSON.parse(JSON.stringify(DEFAULT_PICKS));
   out.devices = (d.devices && typeof d.devices === 'object') ? d.devices : {};
   return out;
 }
@@ -94,11 +104,17 @@ function mergeData(a, b) {
     const x = wm.get(y.id);
     if (!x || (y.updatedAt || 0) > (x.updatedAt || 0)) wm.set(y.id, y);
   }
+  const pm = new Map((a.picks || []).filter(p => p && p.id).map(p => [p.id, p]));
+  for (const y of (b.picks || [])) {
+    if (!y || !y.id) continue;
+    const x = pm.get(y.id);
+    if (!x || (y.updatedAt || 0) > (x.updatedAt || 0)) pm.set(y.id, y);
+  }
   const devices = Object.assign({}, a.devices || {});
   for (const [k, v] of Object.entries(b.devices || {})) {
     if (!devices[k] || (v.t || 0) > (devices[k].t || 0)) devices[k] = v;
   }
-  return { app: 'us-thoughts', version: 1, profiles, thoughts: Array.from(m.values()), wishes: Array.from(wm.values()), devices };
+  return { app: 'us-thoughts', version: 1, profiles, thoughts: Array.from(m.values()), wishes: Array.from(wm.values()), picks: Array.from(pm.values()), devices };
 }
 /* 规范化指纹：字段序、键序固定，避免两端因对象键顺序不同而互相误判「有变化」 */
 const canon = d => JSON.stringify({
@@ -113,12 +129,16 @@ const canon = d => JSON.stringify({
   w: (d.wishes || []).slice().sort((a, b) => a.id < b.id ? -1 : 1).map(w => [
     w.id, w.text, w.addedBy, w.ts || 0, w.updatedAt || 0, !!w.deleted,
     w.done ? [w.done.by, w.done.at || 0] : 0, w.img ? [w.img.id, !!w.img.pending] : 0
+  ]),
+  k: (d.picks || []).slice().sort((a, b) => a.id < b.id ? -1 : 1).map(p => [
+    p.id, p.name, p.emoji, p.color, (p.options || []).join(''), p.order || 0, p.updatedAt || 0, !!p.deleted
   ])
 });
 function purgeTombstones() { /* 90 天前的删除墓碑清理，避免无限增长 */
   const lim = Date.now() - 90 * 864e5;
   data.thoughts = data.thoughts.filter(t => !(t.deleted && (t.updatedAt || 0) < lim));
   data.wishes = (data.wishes || []).filter(w => !(w.deleted && (w.updatedAt || 0) < lim));
+  data.picks = (data.picks || []).filter(p => !(p.deleted && (p.updatedAt || 0) < lim));
   for (const t of data.thoughts) {
     if (t.replies) t.replies = t.replies.filter(r => !(r.deleted && (r.updatedAt || 0) < lim));
   }
@@ -239,6 +259,38 @@ function deleteWish(id) {
   const w = data.wishes.find(x => x.id === id); if (!w) return;
   if (w.img) { discardImage(w.img); w.img = null; }
   w.deleted = true; w.updatedAt = Date.now(); commit();
+}
+/* --- 随心选：分类 + 选项，整条按 updatedAt 新者胜合并 --- */
+const picks = () => (data.picks || []).filter(p => !p.deleted).sort((a, b) => (a.order || 0) - (b.order || 0) || (a.updatedAt || 0) - (b.updatedAt || 0));
+const pickById = id => (data.picks || []).find(p => p.id === id && !p.deleted);
+function addPick(name, emoji) {
+  const used = new Set(picks().map(p => p.color));
+  const color = PALETTE.find(c => !used.has(c)) || PALETTE[picks().length % PALETTE.length];
+  const order = picks().reduce((m, p) => Math.max(m, p.order || 0), -1) + 1;
+  data.picks.push({ id: 'pk-' + uuid().slice(0, 8), name: (name || '').trim() || '新分类', emoji: emoji || '🎲', color, options: [], order, updatedAt: Date.now(), deleted: false });
+  commit();
+}
+function updatePick(id, patch) {
+  const p = data.picks.find(x => x.id === id); if (!p) return;
+  if (patch.name !== undefined) { const s = patch.name.trim(); if (s) p.name = s; }
+  if (patch.emoji !== undefined) p.emoji = patch.emoji;
+  if (patch.options !== undefined) p.options = patch.options.filter(o => (o || '').trim()).map(o => o.trim());
+  p.updatedAt = Date.now(); commit();
+}
+function addPickOption(id, text) {
+  const p = data.picks.find(x => x.id === id); if (!p) return;
+  text = (text || '').trim(); if (!text) return;
+  p.options = (p.options || []).concat(text);
+  p.updatedAt = Date.now(); commit();
+}
+function removePickOption(id, idx) {
+  const p = data.picks.find(x => x.id === id); if (!p) return;
+  p.options = (p.options || []).filter((_, i) => i !== idx);
+  p.updatedAt = Date.now(); commit();
+}
+function deletePick(id) {
+  const p = data.picks.find(x => x.id === id); if (!p) return;
+  p.deleted = true; p.updatedAt = Date.now(); commit();
 }
 function addReply(tid, text) {
   const t = data.thoughts.find(x => x.id === tid); if (!t) return;
@@ -662,6 +714,11 @@ const ui = {
   reactOpen: null,      /* 展开贴纸面板的想法 id */
   actsOn: null,         /* 手机上点开操作按钮的卡片 */
   wDraft: '', wActsOn: null, wEditId: null, wEditDraft: '', wImgFor: null,
+  pickId: null,         /* 当前展开的随心选分类 */
+  pickFor: 'me',        /* me=给我抽 | ta=给 TA 抽 */
+  pickResult: null,     /* {catId, text} 抽中结果 */
+  pickSpin: false,      /* 正在滚动动画 */
+  pickEdit: false, pickOptDraft: '', pickNewName: '',
   sheet: false
 };
 function view() {
@@ -850,6 +907,7 @@ function vTabs() {
   <div id="tabs">
     <button class="${ui.tab === 'feed' ? 'on' : ''}" data-tab="feed">想法</button>
     <button class="${ui.tab === 'list' ? 'on' : ''}" data-tab="list">100 件事${ws.length ? `<i>${ws.filter(w => w.done).length}/${ws.length}</i>` : ''}</button>
+    <button class="${ui.tab === 'pick' ? 'on' : ''}" data-tab="pick">随心选</button>
     ${seen ? `<span class="lastseen"><span class="dot8" style="background:${colorOf(seen.name)}"></span>${esc(seen.name)} ${seenStr(seen.t)}来过</span>` : ''}
   </div>`;
 }
@@ -939,7 +997,56 @@ function vList() {
   <input type="file" id="w-file" accept="image/*" hidden>
   `;
 }
-function vMain() { return vTabs() + (ui.tab === 'list' ? vList() : vFeed()); }
+/* --- 视图：随心选 --- */
+function vPick() {
+  const list = picks();
+  let cur = ui.pickId ? pickById(ui.pickId) : null;
+  if (!cur) cur = list[0] || null; /* 选中的分类被删/失效时回退到第一个 */
+  if (cur) ui.pickId = cur.id;
+  const partner = Object.keys(data.profiles || {}).find(n => n !== me());
+  return `
+  <div class="pk-cats">
+    ${list.map(p => `<button class="pk-cat ${cur && cur.id === p.id ? 'on' : ''}" data-pick="${p.id}" style="${cur && cur.id === p.id ? `background:${p.color};border-color:${p.color}` : ''}">
+      <span class="pe">${esc(p.emoji || '🎲')}</span>${esc(p.name)}</button>`).join('')}
+    <button class="pk-cat add" data-act="pk-newcat">＋ 分类</button>
+  </div>
+  ${!cur ? `<div class="empty">还没有分类。<br>点「＋ 分类」加一个，比如奶茶、饭店、约会。</div>` : `
+  <div class="pk-stage card" style="border-color:${cur.color}">
+    <div class="pk-result ${ui.pickSpin ? 'spin' : ''}" style="color:${cur.color}">
+      ${ui.pickResult && ui.pickResult.catId === cur.id
+        ? esc(ui.pickResult.text)
+        : (cur.options && cur.options.length ? '<span class="pk-hint">点下面按钮，随心选一个</span>' : '<span class="pk-hint">这个分类还没有选项，去下面加几个</span>')}
+    </div>
+    ${ui.pickResult && ui.pickResult.catId === cur.id && !ui.pickSpin && ui.pickResult.forName
+      ? `<div class="pk-forwho">已为 <b>${esc(ui.pickResult.forName)}</b> 抽中${ui.pickResult.posted ? ' · 已送到 TA 的想法流 ✓' : ''}</div>` : ''}
+    <div class="pk-forsel">
+      <button class="${ui.pickFor === 'me' ? 'on' : ''}" data-pfor="me">给我抽</button>
+      <button class="${ui.pickFor === 'ta' ? 'on' : ''}" data-pfor="ta" ${partner ? '' : 'disabled title="等对方登录后可用"'}>给 ${partner ? esc(partner) : 'TA'} 抽</button>
+    </div>
+    <button class="pk-go" data-act="pk-spin" style="background:${cur.color}" ${(cur.options && cur.options.length && !ui.pickSpin) ? '' : 'disabled'}>
+      ${ui.pickSpin ? '抽选中…' : '随心选 🎲'}
+    </button>
+  </div>
+  <div class="pk-opts-head">
+    <span>${esc(cur.emoji || '')} ${esc(cur.name)} · ${(cur.options || []).length} 个选项</span>
+    <button data-act="pk-edit">${ui.pickEdit ? '完成' : '编辑'}</button>
+  </div>
+  <div class="pk-opts">
+    ${(cur.options || []).map((o, i) => `<span class="pk-opt">${esc(o)}${ui.pickEdit ? `<button class="ox" data-opt="${i}">✕</button>` : ''}</span>`).join('')}
+    ${!(cur.options || []).length ? '<span class="pk-hint2">还没有选项</span>' : ''}
+  </div>
+  ${ui.pickEdit ? `
+  <div class="pk-add">
+    <input id="pk-opt-in" placeholder="加一个选项，如「蜜雪」" value="${esc(ui.pickOptDraft)}" maxlength="30">
+    <button data-act="pk-addopt">加入</button>
+  </div>
+  <div class="pk-catedit">
+    <button class="btn" data-act="pk-rename">改分类名 / 图标</button>
+    <button class="btn" data-act="pk-delcat">删除该分类</button>
+  </div>` : ''}
+  `}`;
+}
+function vMain() { return vTabs() + ({ list: vList, pick: vPick, feed: vFeed }[ui.tab] || vFeed)(); }
 
 /* --- 设置弹层 --- */
 function sheetHtml() {
@@ -1050,6 +1157,45 @@ async function pickImage(file) {
   try { ui.cmpImg = await compressImage(file); render(); }
   catch (e) { alert(e.message); }
 }
+/* 随心选：老虎机式滚动动画，减速停在随机结果 */
+function doSpin() {
+  const cur = pickById(ui.pickId);
+  if (!cur || !cur.options || !cur.options.length || ui.pickSpin) return;
+  const opts = cur.options;
+  const finalText = opts[Math.floor(Math.random() * opts.length)];
+  ui.pickSpin = true;
+  ui.pickResult = { catId: cur.id, text: opts[0] };
+  render();
+  let delay = 55, elapsed = 0, i = 0;
+  const step = () => {
+    const node = $('.pk-result');
+    if (!node || !ui.pickSpin) { ui.pickSpin = false; return; }
+    elapsed += delay;
+    if (elapsed >= 1900) { /* 落定 */
+      node.textContent = finalText;
+      ui.pickSpin = false;
+      finishSpin(cur, finalText);
+      return;
+    }
+    i = (i + 1) % opts.length;
+    node.textContent = opts[i];
+    delay = Math.min(300, delay + 14); /* 逐渐减速 */
+    setTimeout(step, delay);
+  };
+  setTimeout(step, delay);
+}
+function finishSpin(cur, text) {
+  ui.pickResult = { catId: cur.id, text };
+  if (ui.pickFor === 'ta') {
+    const partner = Object.keys(data.profiles || {}).find(n => n !== me());
+    if (partner) {
+      ui.pickResult.forName = partner; ui.pickResult.posted = true;
+      addThought(`🎁 我帮你随心选了个${cur.name}：${cur.emoji || ''} ${text}`, null, cur.color, '#FBF3E4'); /* commit 内含 render */
+      return;
+    }
+  }
+  render();
+}
 $('#main').addEventListener('click', e => {
   const v = view();
   /* 登录页 */
@@ -1072,8 +1218,48 @@ $('#main').addEventListener('click', e => {
   if (v !== 'main') return;
   /* 页签 / 筛选 */
   const tab = e.target.closest('[data-tab]');
-  if (tab) { ui.tab = tab.dataset.tab; render(); return; }
+  if (tab) { ui.tab = tab.dataset.tab; ui.pickResult = null; ui.pickSpin = false; render(); return; }
   if (e.target.id === 'f-clear') { ui.q = ''; ui.month = ''; render(); return; }
+  /* 随心选 */
+  if (ui.tab === 'pick') {
+    const pc = e.target.closest('[data-pick]');
+    if (pc) { ui.pickId = pc.dataset.pick; ui.pickResult = null; ui.pickEdit = false; render(); return; }
+    const pf = e.target.closest('[data-pfor]');
+    if (pf) { ui.pickFor = pf.dataset.pfor; $$('.pk-forsel button').forEach(b => b.classList.toggle('on', b.dataset.pfor === ui.pickFor)); return; }
+    const ox = e.target.closest('[data-opt]');
+    if (ox) { removePickOption(ui.pickId, Number(ox.dataset.opt)); return; }
+    const pact = e.target.closest('[data-act]');
+    if (pact) {
+      switch (pact.dataset.act) {
+        case 'pk-spin': doSpin(); break;
+        case 'pk-edit': ui.pickEdit = !ui.pickEdit; ui.pickOptDraft = ''; render(); break;
+        case 'pk-addopt': {
+          const el = $('#pk-opt-in'); const t = el ? el.value.trim() : '';
+          if (t) { ui.pickOptDraft = ''; addPickOption(ui.pickId, t); const e2 = $('#pk-opt-in'); if (e2) e2.focus(); }
+          break;
+        }
+        case 'pk-newcat': {
+          const name = prompt('新分类名字（比如：电影、去哪玩）'); if (name == null) break;
+          const emoji = prompt('给它一个 emoji 图标（可留空）', '🎲') || '🎲';
+          addPick(name, emoji.trim().slice(0, 2));
+          const list = picks(); ui.pickId = list[list.length - 1].id; ui.pickEdit = true; ui.pickResult = null; render();
+          break;
+        }
+        case 'pk-rename': {
+          const cur = pickById(ui.pickId); if (!cur) break;
+          const name = prompt('分类名字', cur.name); if (name == null) break;
+          const emoji = prompt('emoji 图标', cur.emoji || '🎲');
+          updatePick(ui.pickId, { name, emoji: (emoji || cur.emoji || '🎲').trim().slice(0, 2) });
+          break;
+        }
+        case 'pk-delcat':
+          if (confirm('删除这个分类？（选项也会一起删）')) { const nx = picks().find(p => p.id !== ui.pickId); deletePick(ui.pickId); ui.pickId = nx ? nx.id : null; ui.pickResult = null; ui.pickEdit = false; }
+          break;
+      }
+      return;
+    }
+    return;
+  }
   /* 想法流 */
   if (e.target.id === 'cmp-send') { doPublish(); return; }
   if (e.target.id === 'cmp-imgbtn') { $('#cmp-file').click(); return; }
@@ -1250,6 +1436,7 @@ $('#main').addEventListener('input', e => {
   if (e.target.id === 'q-in') { ui.q = e.target.value; qRender(); }
   if (e.target.id === 'w-in') ui.wDraft = e.target.value;
   if (e.target.id === 'w-edit-in') ui.wEditDraft = e.target.value;
+  if (e.target.id === 'pk-opt-in') ui.pickOptDraft = e.target.value;
 });
 $('#main').addEventListener('keydown', e => {
   if (e.isComposing || e.keyCode === 229) return; /* 中文输入法选词的 Enter 不算发送 */
@@ -1267,6 +1454,7 @@ $('#main').addEventListener('keydown', e => {
   if (e.target.id === 'g-token' && e.key === 'Enter') { e.preventDefault(); doLogin(); }
   if (e.target.id === 'who-name' && e.key === 'Enter') { e.preventDefault(); const b = $('#who-ok'); if (b) b.click(); }
   if (e.target.id === 'w-in' && e.key === 'Enter') { e.preventDefault(); const b = $('#w-add'); if (b) b.click(); }
+  if (e.target.id === 'pk-opt-in' && e.key === 'Enter') { e.preventDefault(); const t = e.target.value.trim(); if (t) { ui.pickOptDraft = ''; addPickOption(ui.pickId, t); const el = $('#pk-opt-in'); if (el) el.focus(); } }
   if (e.target.id === 'w-edit-in' && e.key === 'Enter') { e.preventDefault(); const b = $('[data-act="w-edit-save"]'); if (b) b.click(); }
 });
 

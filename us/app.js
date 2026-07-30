@@ -35,7 +35,7 @@ const DEFAULT_PICKS = [
 ];
 
 function freshData() {
-  return { app: 'us-thoughts', version: 1, profiles: {}, thoughts: [], wishes: [], picks: JSON.parse(JSON.stringify(DEFAULT_PICKS)), devices: {} };
+  return { app: 'us-thoughts', version: 1, profiles: {}, thoughts: [], wishes: [], picks: JSON.parse(JSON.stringify(DEFAULT_PICKS)), lock: null, devices: {} };
 }
 function normalize(d) {
   if (!d || typeof d !== 'object') return null;
@@ -44,6 +44,8 @@ function normalize(d) {
   out.thoughts = Array.isArray(d.thoughts) ? d.thoughts.filter(t => t && t.id) : [];
   out.wishes = Array.isArray(d.wishes) ? d.wishes.filter(w => w && w.id) : [];
   out.picks = Array.isArray(d.picks) ? d.picks.filter(p => p && p.id) : JSON.parse(JSON.stringify(DEFAULT_PICKS));
+  /* lock 保留「撤锁墓碑」（h 为空但有 updatedAt），否则撤锁无法同步到其他设备 */
+  out.lock = (d.lock && typeof d.lock === 'object' && (d.lock.h || d.lock.updatedAt)) ? d.lock : null;
   out.devices = (d.devices && typeof d.devices === 'object') ? d.devices : {};
   return out;
 }
@@ -114,7 +116,10 @@ function mergeData(a, b) {
   for (const [k, v] of Object.entries(b.devices || {})) {
     if (!devices[k] || (v.t || 0) > (devices[k].t || 0)) devices[k] = v;
   }
-  return { app: 'us-thoughts', version: 1, profiles, thoughts: Array.from(m.values()), wishes: Array.from(wm.values()), picks: Array.from(pm.values()), devices };
+  /* 私人锁：新者胜（设锁/改锁/撤锁都带时间戳），会同步到所有设备 */
+  const la = a.lock, lb = b.lock;
+  const lock = (((lb && lb.updatedAt) || 0) > ((la && la.updatedAt) || 0)) ? lb : (la || lb || null);
+  return { app: 'us-thoughts', version: 1, profiles, thoughts: Array.from(m.values()), wishes: Array.from(wm.values()), picks: Array.from(pm.values()), lock: lock || null, devices };
 }
 /* 规范化指纹：字段序、键序固定，避免两端因对象键顺序不同而互相误判「有变化」 */
 const canon = d => JSON.stringify({
@@ -132,7 +137,8 @@ const canon = d => JSON.stringify({
   ]),
   k: (d.picks || []).slice().sort((a, b) => a.id < b.id ? -1 : 1).map(p => [
     p.id, p.name, p.emoji, p.color, (p.options || []).join(''), p.order || 0, p.updatedAt || 0, !!p.deleted
-  ])
+  ]),
+  l: d.lock ? [d.lock.h || '', d.lock.updatedAt || 0] : 0
 });
 function purgeTombstones() { /* 90 天前的删除墓碑清理，避免无限增长 */
   const lim = Date.now() - 90 * 864e5;
@@ -719,9 +725,47 @@ const ui = {
   pickResult: null,     /* {catId, text} 抽中结果 */
   pickSpin: false,      /* 正在滚动动画 */
   pickEdit: false, pickOptDraft: '', pickNewName: '',
+  lockErr: '',
   sheet: false
 };
+/* ================= 私人锁 =================
+   口令的哈希存在同步数据里 → 会推到所有已登录设备，别的设备打不开应用。
+   本机验证通过后记住（存哈希），换口令后需重新输入。
+   忘记口令的退路：你是 Gitee 账号主人，可在 gist 里把 "lock" 字段删掉。 */
+const LS_UNLOCK = 'us.unlock.v1';
+async function hashPass(pw) {
+  const salt = 'us-thoughts-lock-v1';
+  if (crypto.subtle) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(salt + '|' + pw));
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+  let h = 5381; /* 无 crypto.subtle（http 环境）时的退化实现 */
+  const s = salt + '|' + pw;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return 'x' + h.toString(16);
+}
+const lockOn = () => !!(data.lock && data.lock.h);
+const unlocked = () => !lockOn() || localStorage.getItem(LS_UNLOCK) === data.lock.h;
+async function setLock(pw) {
+  const h = await hashPass(pw);
+  data.lock = { h, by: me(), updatedAt: Date.now() };
+  localStorage.setItem(LS_UNLOCK, h);
+  commit();
+}
+function removeLock() {
+  data.lock = { h: '', updatedAt: Date.now() }; /* 墓碑：让撤锁也能同步出去 */
+  localStorage.removeItem(LS_UNLOCK);
+  commit();
+}
+async function tryUnlock(pw) {
+  const h = await hashPass(pw);
+  if (!lockOn() || h !== data.lock.h) return false;
+  localStorage.setItem(LS_UNLOCK, h);
+  return true;
+}
+
 function view() {
+  if (lockOn() && !unlocked()) return 'lock';
   if (ui.gate) return ui.gate;
   if (!cloudEnabled() && !localStorage.getItem(LS_LOCAL)) return 'setup';
   if (!me() || !profileOf(me())) return 'who';
@@ -785,6 +829,21 @@ function updateStatusUi() {
   chip.className = 'save-line ' + st.cls;
   chip.title = st.title;
   $('#st-text').textContent = st.txt;
+}
+
+/* --- 视图：私人锁 --- */
+function vLock() {
+  return `
+  <div class="card gate lockgate">
+    <div class="lk-icon">🔒</div>
+    <h2>请输入口令</h2>
+    <p class="lead">这个本子已上私人锁，只有知道口令的人能打开。</p>
+    <div class="token-row">
+      <input class="line" id="lk-in" type="password" placeholder="口令" autocomplete="off" inputmode="text">
+      <button class="btn dark" id="lk-ok">打开</button>
+    </div>
+    ${ui.lockErr ? `<div class="err-msg">${esc(ui.lockErr)}</div>` : ''}
+  </div>`;
 }
 
 /* --- 视图：登录 --- */
@@ -1081,6 +1140,14 @@ function sheetHtml() {
       ${PALETTE.map(cc => `<button data-mycolor="${cc}" class="${myColor === cc ? 'on' : ''}" style="background:${cc}"></button>`).join('')}
     </span>
   </span></div>
+  <div class="kv"><span class="k">私人锁</span><span class="v">
+    ${lockOn()
+      ? `<span class="save-line"><span class="dot"></span>已上锁</span>
+         <button class="btn" data-act="lock-change">改口令</button>
+         <button class="btn" data-act="lock-off">撤销</button>`
+      : `<span class="save-line off"><span class="dot"></span>未上锁</span>
+         <button class="btn dark" data-act="lock-on">设置口令</button>`}
+  </span></div>
   <div class="kv"><span class="k">数据</span><span class="v">
     <button class="btn" data-act="export">导出备份</button>
     <button class="btn" data-act="import">导入备份</button>
@@ -1099,7 +1166,13 @@ function renderSheet() {
 let renderQueued = false;
 function render() {
   renderQueued = false;
-  $('#main').innerHTML = ({ setup: vSetup, who: vWho, main: vMain })[view()]();
+  const v = view();
+  $('#main').innerHTML = ({ lock: vLock, setup: vSetup, who: vWho, main: vMain })[v]();
+  /* 上锁未解锁时藏起设置齿轮与状态，避免绕过锁去改设置 */
+  const locked = v === 'lock';
+  $('#btn-gear').hidden = locked;
+  $('#st-chip').hidden = locked;
+  if (locked) { ui.sheet = false; renderSheet(); const el = $('#lk-in'); if (el) el.focus(); return; }
   const cmp = $('#cmp');
   if (cmp) autosize(cmp);
   hydrateImages();
@@ -1196,8 +1269,18 @@ function finishSpin(cur, text) {
   }
   render();
 }
+async function doUnlock() {
+  const el = $('#lk-in'); if (!el) return;
+  const pw = el.value;
+  if (!pw) { el.focus(); return; }
+  if (await tryUnlock(pw)) { ui.lockErr = ''; render(); syncNow(); }
+  else { ui.lockErr = '口令不对'; render(); const e2 = $('#lk-in'); if (e2) { e2.value = ''; e2.focus(); } }
+}
 $('#main').addEventListener('click', e => {
   const v = view();
+  /* 私人锁 */
+  if (e.target.id === 'lk-ok') { doUnlock(); return; }
+  if (v === 'lock') return;
   /* 登录页 */
   const prov = e.target.closest('[data-prov]');
   if (prov) { ui.cloudProv = prov.dataset.prov; ui.gateErr = ''; render(); return; }
@@ -1451,6 +1534,7 @@ $('#main').addEventListener('keydown', e => {
     const txt = e.target.value.trim();
     if (card && txt) { ui.replyTo = null; ui.replyDraft = ''; addReply(card.dataset.id, txt); }
   }
+  if (e.target.id === 'lk-in' && e.key === 'Enter') { e.preventDefault(); doUnlock(); }
   if (e.target.id === 'g-token' && e.key === 'Enter') { e.preventDefault(); doLogin(); }
   if (e.target.id === 'who-name' && e.key === 'Enter') { e.preventDefault(); const b = $('#who-ok'); if (b) b.click(); }
   if (e.target.id === 'w-in' && e.key === 'Enter') { e.preventDefault(); const b = $('#w-add'); if (b) b.click(); }
@@ -1481,6 +1565,23 @@ $('#sheet').addEventListener('click', e => {
       syncFails = 0; rateLimitUntil = 0; imgRetryCount = 0; imgTries.clear();
       syncNow().then(() => renderSheet());
       renderSheet();
+      break;
+    case 'lock-on':
+    case 'lock-change': {
+      const pw = prompt(act.dataset.act === 'lock-change' ? '设置新口令' : '设置口令（只有知道它的人能打开这个本子）');
+      if (pw == null) break;
+      if (!pw.trim()) { alert('口令不能为空'); break; }
+      const again = prompt('再输一次确认');
+      if (again == null) break;
+      if (again !== pw) { alert('两次输入不一致，没有改动'); break; }
+      setLock(pw).then(() => {
+        renderSheet();
+        alert('已上锁。请记住口令——它会同步到所有已登录的设备，别的设备打不开。\n\n忘记了也有退路：你是 Gitee 账号主人，可以在 Gist 里删掉 lock 字段。');
+      });
+      break;
+    }
+    case 'lock-off':
+      if (confirm('撤销私人锁？之后打开应用不再需要口令。')) { removeLock(); renderSheet(); }
       break;
   }
 });

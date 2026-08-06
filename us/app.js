@@ -16,6 +16,11 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const debounce = (fn, ms) => { let t; const f = (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; f.cancel = () => clearTimeout(t); return f; };
 const WD = ['日', '一', '二', '三', '四', '五', '六'];
+/* 日期串工具（YYYY-MM-DD，按本地时区，避开 UTC 偏移问题） */
+const dstr = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const todayStr = () => dstr(new Date());
+const parseDate = ds => { const [y, m, d] = String(ds).split('-').map(Number); return new Date(y, m - 1, d); };
+const addDays = (ds, n) => { const d = parseDate(ds); d.setDate(d.getDate() + n); return dstr(d); };
 
 /* ================= state / store ================= */
 const LS_KEY = 'us.data.v1';
@@ -35,7 +40,7 @@ const DEFAULT_PICKS = [
 ];
 
 function freshData() {
-  return { app: 'us-thoughts', version: 1, profiles: {}, thoughts: [], wishes: [], picks: JSON.parse(JSON.stringify(DEFAULT_PICKS)), lock: null, devices: {} };
+  return { app: 'us-thoughts', version: 1, profiles: {}, thoughts: [], wishes: [], picks: JSON.parse(JSON.stringify(DEFAULT_PICKS)), lock: null, cycles: [], cycleOwner: null, devices: {} };
 }
 function normalize(d) {
   if (!d || typeof d !== 'object') return null;
@@ -46,6 +51,8 @@ function normalize(d) {
   out.picks = Array.isArray(d.picks) ? d.picks.filter(p => p && p.id) : JSON.parse(JSON.stringify(DEFAULT_PICKS));
   /* lock 保留「撤锁墓碑」（h 为空但有 updatedAt），否则撤锁无法同步到其他设备 */
   out.lock = (d.lock && typeof d.lock === 'object' && (d.lock.h || d.lock.updatedAt)) ? d.lock : null;
+  out.cycles = Array.isArray(d.cycles) ? d.cycles.filter(c => c && c.id && c.start) : [];
+  out.cycleOwner = (d.cycleOwner && typeof d.cycleOwner === 'object') ? d.cycleOwner : null;
   out.devices = (d.devices && typeof d.devices === 'object') ? d.devices : {};
   return out;
 }
@@ -119,7 +126,15 @@ function mergeData(a, b) {
   /* 私人锁：新者胜（设锁/改锁/撤锁都带时间戳），会同步到所有设备 */
   const la = a.lock, lb = b.lock;
   const lock = (((lb && lb.updatedAt) || 0) > ((la && la.updatedAt) || 0)) ? lb : (la || lb || null);
-  return { app: 'us-thoughts', version: 1, profiles, thoughts: Array.from(m.values()), wishes: Array.from(wm.values()), picks: Array.from(pm.values()), lock: lock || null, devices };
+  const cm = new Map((a.cycles || []).filter(c => c && c.id).map(c => [c.id, c]));
+  for (const y of (b.cycles || [])) {
+    if (!y || !y.id) continue;
+    const x = cm.get(y.id);
+    if (!x || (y.updatedAt || 0) > (x.updatedAt || 0)) cm.set(y.id, y);
+  }
+  const oa = a.cycleOwner, ob = b.cycleOwner;
+  const cycleOwner = (((ob && ob.updatedAt) || 0) > ((oa && oa.updatedAt) || 0)) ? ob : (oa || ob || null);
+  return { app: 'us-thoughts', version: 1, profiles, thoughts: Array.from(m.values()), wishes: Array.from(wm.values()), picks: Array.from(pm.values()), lock: lock || null, cycles: Array.from(cm.values()), cycleOwner: cycleOwner || null, devices };
 }
 /* 规范化指纹：字段序、键序固定，避免两端因对象键顺序不同而互相误判「有变化」 */
 const canon = d => JSON.stringify({
@@ -138,13 +153,18 @@ const canon = d => JSON.stringify({
   k: (d.picks || []).slice().sort((a, b) => a.id < b.id ? -1 : 1).map(p => [
     p.id, p.name, p.emoji, p.color, (p.options || []).join(''), p.order || 0, p.updatedAt || 0, !!p.deleted
   ]),
-  l: d.lock ? [d.lock.h || '', d.lock.updatedAt || 0] : 0
+  l: d.lock ? [d.lock.h || '', d.lock.updatedAt || 0] : 0,
+  c: (d.cycles || []).slice().sort((a, b) => a.id < b.id ? -1 : 1).map(c => [
+    c.id, c.start, c.end || '', c.updatedAt || 0, !!c.deleted
+  ]),
+  o: d.cycleOwner ? [d.cycleOwner.name || '', d.cycleOwner.updatedAt || 0] : 0
 });
 function purgeTombstones() { /* 90 天前的删除墓碑清理，避免无限增长 */
   const lim = Date.now() - 90 * 864e5;
   data.thoughts = data.thoughts.filter(t => !(t.deleted && (t.updatedAt || 0) < lim));
   data.wishes = (data.wishes || []).filter(w => !(w.deleted && (w.updatedAt || 0) < lim));
   data.picks = (data.picks || []).filter(p => !(p.deleted && (p.updatedAt || 0) < lim));
+  data.cycles = (data.cycles || []).filter(c => !(c.deleted && (c.updatedAt || 0) < lim));
   for (const t of data.thoughts) {
     if (t.replies) t.replies = t.replies.filter(r => !(r.deleted && (r.updatedAt || 0) < lim));
   }
@@ -266,6 +286,80 @@ function deleteWish(id) {
   if (w.img) { discardImage(w.img); w.img = null; }
   w.deleted = true; w.updatedAt = Date.now(); commit();
 }
+/* ================= 姨妈记录 =================
+   cycles: [{id, start:'YYYY-MM-DD', end:'YYYY-MM-DD'|null, updatedAt, deleted}]
+   预测按最近几次的实际间隔取平均；排卵/易孕窗口为推算值，仅供参考。 */
+const DEF_CYCLE_LEN = 28, DEF_PERIOD_LEN = 5;
+const cycles = () => (data.cycles || []).filter(c => !c.deleted && c.start).sort((a, b) => a.start < b.start ? -1 : 1);
+const cycleOwnerName = () => (data.cycleOwner && data.cycleOwner.name) || '';
+const iAmOwner = () => !cycleOwnerName() || cycleOwnerName() === me();
+function setCycleOwner(name) {
+  data.cycleOwner = { name: name || '', updatedAt: Date.now() };
+  commit();
+}
+const daysBetween = (a, b) => Math.round((parseDate(b) - parseDate(a)) / 864e5);
+const OPEN_MAX = 10; /* 忘记点「结束了」时，最多按 10 天算作进行中，避免天数一直涨 */
+function currentCycle() { /* 正在进行中的一次 */
+  const t = todayStr();
+  return cycles().slice().reverse().find(c =>
+    c.start <= t && (c.end ? c.end >= t : daysBetween(c.start, t) < OPEN_MAX)) || null;
+}
+function cycleSpan(c) { /* 这次记录在日历上覆盖的最后一天：没记结束的只画到今天，不虚构未来 */
+  if (c.end) return c.end;
+  const t = todayStr();
+  const capped = addDays(c.start, OPEN_MAX - 1);
+  const lastVisible = capped < t ? capped : t;
+  return lastVisible < c.start ? c.start : lastVisible;
+}
+function startPeriod(dateStr) {
+  const d = dateStr || todayStr();
+  if (cycles().some(c => c.start === d)) return;
+  data.cycles.push({ id: uuid(), start: d, end: null, updatedAt: Date.now(), deleted: false });
+  commit();
+}
+function endPeriod(dateStr) {
+  const c = currentCycle(); if (!c) return;
+  const d = dateStr || todayStr();
+  const row = data.cycles.find(x => x.id === c.id); if (!row) return;
+  row.end = d < row.start ? row.start : d;
+  row.updatedAt = Date.now();
+  commit();
+}
+function deleteCycle(id) {
+  const c = data.cycles.find(x => x.id === id); if (!c) return;
+  c.deleted = true; c.updatedAt = Date.now(); commit();
+}
+function cycleStats() {
+  const cs = cycles();
+  const gaps = [];
+  for (let i = 1; i < cs.length; i++) {
+    const g = daysBetween(cs[i - 1].start, cs[i].start);
+    if (g >= 15 && g <= 60) gaps.push(g); /* 剔除明显异常，避免误记把平均值带偏 */
+  }
+  const recentGaps = gaps.slice(-6);
+  const avgCycle = recentGaps.length ? Math.round(recentGaps.reduce((s, g) => s + g, 0) / recentGaps.length) : DEF_CYCLE_LEN;
+  const lens = cs.filter(c => c.end).map(c => daysBetween(c.start, c.end) + 1).filter(n => n >= 1 && n <= 15);
+  const avgLen = lens.length ? Math.round(lens.slice(-6).reduce((s, n) => s + n, 0) / Math.min(6, lens.length)) : DEF_PERIOD_LEN;
+  const last = cs[cs.length - 1] || null;
+  const nextStart = last ? addDays(last.start, avgCycle) : null;
+  return { count: cs.length, avgCycle, avgLen, last, nextStart, estimated: recentGaps.length === 0 };
+}
+function fertileWindow(nextStart) { /* 排卵日 ≈ 下次月经前 14 天；易孕窗口 = 排卵前 5 天 ~ 后 1 天 */
+  if (!nextStart) return null;
+  const ovu = addDays(nextStart, -14);
+  return { ovu, from: addDays(ovu, -5), to: addDays(ovu, 1) };
+}
+function cycleDayInfo() { /* 顶部状态：经期中第几天 / 距离下次还有几天 / 推迟几天 */
+  const t = todayStr();
+  const cur = currentCycle();
+  const st = cycleStats();
+  if (cur) return { state: 'on', day: daysBetween(cur.start, t) + 1, cycle: cur, stats: st };
+  if (!st.nextStart) return { state: 'none', stats: st };
+  const diff = daysBetween(t, st.nextStart);
+  if (diff >= 0) return { state: 'wait', days: diff, stats: st };
+  return { state: 'late', days: -diff, stats: st };
+}
+
 /* --- 随心选：分类 + 选项，整条按 updatedAt 新者胜合并 --- */
 const picks = () => (data.picks || []).filter(p => !p.deleted).sort((a, b) => (a.order || 0) - (b.order || 0) || (a.updatedAt || 0) - (b.updatedAt || 0));
 const pickById = id => (data.picks || []).find(p => p.id === id && !p.deleted);
@@ -725,6 +819,7 @@ const ui = {
   pickResult: null,     /* {catId, text} 抽中结果 */
   pickSpin: false,      /* 正在滚动动画 */
   pickEdit: false, pickOptDraft: '', pickNewName: '',
+  cycYM: null,          /* 姨妈日历显示的月份 {y,m}，null=本月 */
   lockErr: '',
   sheet: false
 };
@@ -967,6 +1062,7 @@ function vTabs() {
     <button class="${ui.tab === 'feed' ? 'on' : ''}" data-tab="feed">想法</button>
     <button class="${ui.tab === 'list' ? 'on' : ''}" data-tab="list">100 件事${ws.length ? `<i>${ws.filter(w => w.done).length}/${ws.length}</i>` : ''}</button>
     <button class="${ui.tab === 'pick' ? 'on' : ''}" data-tab="pick">随心选</button>
+    <button class="${ui.tab === 'cyc' ? 'on' : ''}" data-tab="cyc">姨妈</button>
     ${seen ? `<span class="lastseen"><span class="dot8" style="background:${colorOf(seen.name)}"></span>${esc(seen.name)} ${seenStr(seen.t)}来过</span>` : ''}
   </div>`;
 }
@@ -1105,7 +1201,125 @@ function vPick() {
   </div>` : ''}
   `}`;
 }
-function vMain() { return vTabs() + ({ list: vList, pick: vPick, feed: vFeed }[ui.tab] || vFeed)(); }
+/* --- 视图：姨妈记录 --- */
+function vCycle() {
+  const owner = cycleOwnerName();
+  const names = Object.keys(data.profiles || {});
+  if (!owner) { /* 首次：先确认这是谁的记录，才能分「本人视图 / 体贴视图」 */
+    return `
+    <div class="card gate cyc-setup">
+      <h2>这是谁的记录？</h2>
+      <p class="lead">选一个人，之后 TA 打开是记录界面，另一位打开是体贴提醒界面。</p>
+      <div class="who-list">
+        ${names.map(n => `<button data-cycowner="${esc(n)}"><span class="dot8" style="background:${colorOf(n)}"></span>${esc(n)}</button>`).join('')}
+      </div>
+      ${names.length < 2 ? '<div class="tip">提示：等两个人都登录过，这里就能选到对方。</div>' : ''}
+    </div>`;
+  }
+  const mine = iAmOwner();
+  const info = cycleDayInfo();
+  const st = info.stats;
+  const fw = fertileWindow(st.nextStart);
+  const cur = currentCycle();
+
+  /* 顶部状态卡：本人是行动界面，对方是体贴提醒 */
+  let big = '', sub = '', tip = '';
+  if (info.state === 'on') {
+    big = mine ? `第 ${info.day} 天` : `${esc(owner)} 第 ${info.day} 天`;
+    sub = cur.end ? `已记录到 ${cur.end}` : '还在进行中';
+    if (!mine) tip = info.day <= 2 ? '这两天最难受，别让 TA 碰凉的，多喝热水 🍵' : '记得多问一句「今天好点没」';
+  } else if (info.state === 'wait') {
+    big = info.days === 0 ? '预计就是今天' : `还有 ${info.days} 天`;
+    sub = `预计 ${st.nextStart}${st.estimated ? '（按 28 天默认值推算）' : ''}`;
+    if (!mine && info.days <= 3) tip = '快到了，可以提前备点红糖姜茶 ☕';
+  } else if (info.state === 'late') {
+    big = `已推迟 ${info.days} 天`;
+    sub = `预计是 ${st.nextStart}`;
+    if (!mine) tip = '周期本来就会浮动，先别紧张';
+  } else {
+    big = '还没有记录';
+    sub = '点下面的按钮记下第一次';
+  }
+
+  return `
+  <div class="cyc-status card ${info.state}">
+    <div class="cyc-big">${big}</div>
+    <div class="cyc-sub">${esc(sub)}</div>
+    ${tip ? `<div class="cyc-tip">${tip}</div>` : ''}
+    <div class="cyc-acts">
+      ${info.state === 'on'
+        ? `<button class="cyc-btn end" data-act="cyc-end">${mine ? '结束了' : '记录：结束了'}</button>`
+        : `<button class="cyc-btn start" data-act="cyc-start">${mine ? '姨妈来了' : '记录：来了'}</button>`}
+      <button class="cyc-btn ghost" data-act="cyc-other">记其他日期</button>
+    </div>
+  </div>
+  ${vCycCal(st, fw)}
+  <div class="cyc-stats">
+    <div><b>${st.avgCycle}</b><span>平均周期(天)</span></div>
+    <div><b>${st.avgLen}</b><span>平均持续(天)</span></div>
+    <div><b>${st.count}</b><span>已记录(次)</span></div>
+  </div>
+  ${fw ? `<p class="cyc-note">浅色区间是按平均周期推算的易孕期，🥚 为估算排卵日。<b>仅供参考，会受作息、压力、生病影响，不能作为避孕依据。</b></p>`
+       : '<p class="cyc-note">记满两次之后，预测会按你们自己的实际周期来算。</p>'}
+  ${st.count ? `
+  <div class="day-label">历史记录</div>
+  <div class="cyc-hist">
+    ${cycles().slice().reverse().slice(0, 12).map((c, i, arr) => {
+      const ongoing = !c.end && currentCycle() && currentCycle().id === c.id;
+      const len = c.end ? daysBetween(c.start, c.end) + 1 : null;
+      const prev = arr[i + 1];
+      const gap = prev ? daysBetween(prev.start, c.start) : null;
+      return `<div class="cyc-row" data-cyc="${c.id}">
+        <span class="cd">${c.start.slice(5)}${c.end ? ' ~ ' + c.end.slice(5) : (ongoing ? ' ~ 进行中' : ' ~ 未记结束')}</span>
+        <span class="cl">${len ? len + ' 天' : ''}</span>
+        <span class="cg">${gap ? '间隔 ' + gap + ' 天' : ''}</span>
+        <button class="cx" data-act="cyc-del" title="删除这次记录">✕</button>
+      </div>`;
+    }).join('')}
+  </div>` : ''}
+  <div class="cyc-owner">记录归属：${esc(owner)} · <button data-act="cyc-chowner">修改</button></div>
+  `;
+}
+function vCycCal(st, fw) { /* 月历：实心=已记录，虚线=预测，浅底=易孕期 */
+  const now = new Date();
+  const ym = ui.cycYM || { y: now.getFullYear(), m: now.getMonth() + 1 };
+  const first = new Date(ym.y, ym.m - 1, 1);
+  const days = new Date(ym.y, ym.m, 0).getDate();
+  const lead = first.getDay();
+  const t = todayStr();
+  const cs = cycles();
+  const onDay = ds => cs.some(c => ds >= c.start && ds <= cycleSpan(c));
+  const predDays = [];
+  if (st.nextStart) for (let i = 0; i < st.avgLen; i++) predDays.push(addDays(st.nextStart, i));
+  const cells = [];
+  for (let i = 0; i < lead; i++) cells.push('<span class="cc pad"></span>');
+  for (let d = 1; d <= days; d++) {
+    const ds = `${ym.y}-${pad(ym.m)}-${pad(d)}`;
+    const cls = ['cc'];
+    if (onDay(ds)) cls.push('on');
+    else if (predDays.includes(ds)) cls.push('pred');
+    if (fw && ds >= fw.from && ds <= fw.to) cls.push('fert');
+    if (ds === t) cls.push('today');
+    const egg = fw && ds === fw.ovu ? '<i>🥚</i>' : '';
+    cells.push(`<button class="${cls.join(' ')}" data-cday="${ds}">${d}${egg}</button>`);
+  }
+  return `
+  <div class="cyc-cal card">
+    <div class="cal-head">
+      <button data-act="cyc-prev">‹</button>
+      <b>${ym.y} 年 ${ym.m} 月</b>
+      <button data-act="cyc-next">›</button>
+    </div>
+    <div class="cal-wd">${WD.map(w => `<span>${w}</span>`).join('')}</div>
+    <div class="cal-grid">${cells.join('')}</div>
+    <div class="cal-legend">
+      <span><i class="lg on"></i>已记录</span>
+      <span><i class="lg pred"></i>预测</span>
+      ${fw ? '<span><i class="lg fert"></i>易孕期(推算)</span>' : ''}
+    </div>
+  </div>`;
+}
+function vMain() { return vTabs() + ({ list: vList, pick: vPick, cyc: vCycle, feed: vFeed }[ui.tab] || vFeed)(); }
 
 /* --- 设置弹层 --- */
 function sheetHtml() {
@@ -1269,6 +1483,19 @@ function finishSpin(cur, text) {
   }
   render();
 }
+function onCycDayTap(ds, quiet) { /* 点日历某天：已在记录内→可删；否则→记为开始 / 补记结束 */
+  const inCycle = cycles().find(c => ds >= c.start && ds <= cycleSpan(c));
+  if (inCycle) {
+    if (confirm(`${ds} 已在一次记录里（${inCycle.start} 开始）。要删除这次记录吗？`)) deleteCycle(inCycle.id);
+    return;
+  }
+  const cur = currentCycle();
+  if (cur && ds > cur.start) {
+    if (confirm(`把 ${ds} 记为这次的结束日？`)) endPeriod(ds);
+    return;
+  }
+  if (quiet || confirm(`把 ${ds} 记为姨妈开始的日子？`)) startPeriod(ds);
+}
 async function doUnlock() {
   const el = $('#lk-in'); if (!el) return;
   const pw = el.value;
@@ -1303,6 +1530,43 @@ $('#main').addEventListener('click', e => {
   const tab = e.target.closest('[data-tab]');
   if (tab) { ui.tab = tab.dataset.tab; ui.pickResult = null; ui.pickSpin = false; render(); return; }
   if (e.target.id === 'f-clear') { ui.q = ''; ui.month = ''; render(); return; }
+  /* 姨妈记录 */
+  if (ui.tab === 'cyc') {
+    const ow = e.target.closest('[data-cycowner]');
+    if (ow) { setCycleOwner(ow.dataset.cycowner); return; }
+    const cd = e.target.closest('[data-cday]');
+    if (cd) { onCycDayTap(cd.dataset.cday); return; }
+    const ca = e.target.closest('[data-act]');
+    if (ca) {
+      switch (ca.dataset.act) {
+        case 'cyc-start': startPeriod(todayStr()); break;
+        case 'cyc-end': endPeriod(todayStr()); break;
+        case 'cyc-other': {
+          const d = prompt('记录哪一天？格式 2026-08-06', todayStr());
+          if (d == null) break;
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(d.trim())) { alert('日期格式不对，应该像 2026-08-06'); break; }
+          onCycDayTap(d.trim(), true);
+          break;
+        }
+        case 'cyc-prev': case 'cyc-next': {
+          const now = new Date();
+          const ym = ui.cycYM || { y: now.getFullYear(), m: now.getMonth() + 1 };
+          let m = ym.m + (ca.dataset.act === 'cyc-next' ? 1 : -1), y = ym.y;
+          if (m < 1) { m = 12; y--; } if (m > 12) { m = 1; y++; }
+          ui.cycYM = { y, m }; render();
+          break;
+        }
+        case 'cyc-del': {
+          const row = e.target.closest('[data-cyc]');
+          if (row && confirm('删除这次记录？')) deleteCycle(row.dataset.cyc);
+          break;
+        }
+        case 'cyc-chowner': setCycleOwner(''); break;
+      }
+      return;
+    }
+    return;
+  }
   /* 随心选 */
   if (ui.tab === 'pick') {
     const pc = e.target.closest('[data-pick]');

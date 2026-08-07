@@ -1861,5 +1861,19 @@ ddBind();
 render();
 syncNow();
 if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
-  navigator.serviceWorker.register('./sw.js').catch(() => {});
+  /* updateViaCache:'none' —— 连 sw.js 本身也不吃 HTTP 缓存，保证能及时发现新版本 */
+  const hadController = !!navigator.serviceWorker.controller; /* 首次安装时为 false */
+  let swRefreshing = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    /* 新版本接管了：只有「本来就在旧版本上」才刷新——首次安装不刷，避免白刷一次 */
+    if (swRefreshing || !hadController) return;
+    swRefreshing = true;
+    location.reload();
+  });
+  navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' })
+    .then(reg => { reg.update().catch(() => {}); })
+    .catch(() => {});
+  document.addEventListener('visibilitychange', () => { /* 每次切回前台顺手查一次更新 */
+    if (!document.hidden) navigator.serviceWorker.getRegistration().then(r => r && r.update()).catch(() => {});
+  });
 }
